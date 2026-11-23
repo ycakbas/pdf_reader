@@ -269,18 +269,20 @@ impl OpenDocument {
         page_index: usize,
         x_pt: f32,
         y_pt_top: f32,
-        tolerance_pt: f32,
+        tolerance_x_pt: f32,
+        tolerance_y_pt: f32,
     ) -> Option<usize> {
         let page = self.doc.pages().get(page_index as i32).ok()?;
         let page_height = self.page_size_pt(page_index).1;
         let y_pt_pdf = page_height - y_pt_top;
         let text = page.text().ok()?;
         let chars = text.chars();
+        // NOTE: pdfium-render's parameter order is (x, tolerance_x, y, tolerance_y).
         let ch = chars.get_char_near_point(
             PdfPoints::new(x_pt),
+            PdfPoints::new(tolerance_x_pt),
             PdfPoints::new(y_pt_pdf),
-            PdfPoints::new(tolerance_pt),
-            PdfPoints::new(tolerance_pt),
+            PdfPoints::new(tolerance_y_pt),
         )?;
         Some(ch.index())
     }

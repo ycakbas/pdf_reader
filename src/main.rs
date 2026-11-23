@@ -39,6 +39,7 @@ fn main() -> Result<()> {
 
     let initial_file = cli.file;
     let initial_page = cli.page.map(|p| p.saturating_sub(1));
+    let config_path = cli.config;
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -55,6 +56,7 @@ fn main() -> Result<()> {
             Ok(Box::new(app::PdfReaderApp::new(
                 cc,
                 cfg,
+                config_path,
                 initial_file,
                 initial_page,
             )))

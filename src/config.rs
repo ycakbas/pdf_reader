@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::ThemeSpec;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultFitMode {
+    FitWidth,
+    FitPage,
+    Manual,
+}
+
+impl DefaultFitMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FitWidth => "Fit Width",
+            Self::FitPage => "Fit Page",
+            Self::Manual => "Manual (100%)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -20,6 +38,8 @@ pub struct Config {
     pub continuous_scroll: bool,
     /// Gap in logical pixels between pages in continuous scroll mode.
     pub page_gap: f32,
+    /// Initial zoom fit mode when opening the viewer.
+    pub default_fit_mode: DefaultFitMode,
     /// Mouse behavior settings.
     pub mouse: MouseConfig,
     /// Keyboard shortcut bindings.
@@ -35,6 +55,7 @@ impl Default for Config {
             show_toolbar: true,
             continuous_scroll: true,
             page_gap: 12.0,
+            default_fit_mode: DefaultFitMode::FitWidth,
             mouse: MouseConfig::default(),
             shortcuts: ShortcutConfig::default(),
             themes: BTreeMap::new(),
@@ -47,25 +68,21 @@ impl Config {
         ProjectDirs::from("", "", "pdf_reader").map(|dirs| dirs.config_dir().join("config.toml"))
     }
 
-    pub fn load_or_default(explicit_path: Option<&Path>) -> Result<Self> {
-        let path = match explicit_path {
+    pub fn resolve_path(explicit_path: Option<&Path>) -> Option<PathBuf> {
+        match explicit_path {
             Some(p) => Some(p.to_path_buf()),
             None => Self::default_path(),
-        };
+        }
+    }
 
-        let Some(path) = path else {
+    pub fn load_or_default(explicit_path: Option<&Path>) -> Result<Self> {
+        let Some(path) = Self::resolve_path(explicit_path) else {
             return Ok(Self::default());
         };
 
         if !path.exists() {
             let cfg = Self::default();
-            // Best-effort write of default config so users can discover and edit it.
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            if let Ok(serialized) = toml::to_string_pretty(&cfg) {
-                let _ = fs::write(&path, serialized);
-            }
+            let _ = cfg.save(Some(&path));
             return Ok(cfg);
         }
 
@@ -75,22 +92,79 @@ impl Config {
             .with_context(|| format!("failed to parse config at {}", path.display()))?;
         Ok(cfg)
     }
+
+    pub fn save(&self, explicit_path: Option<&Path>) -> Result<PathBuf> {
+        let path = Self::resolve_path(explicit_path)
+            .context("could not determine config directory for this platform")?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create config dir {}", parent.display()))?;
+        }
+        let serialized = toml::to_string_pretty(self).context("failed to serialize config")?;
+        fs::write(&path, serialized)
+            .with_context(|| format!("failed to write config at {}", path.display()))?;
+        Ok(path)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MouseButtonSpec {
-    Left,
-    Middle,
-    Right,
+pub enum DragAction {
+    SelectText,
+    Pan,
+    None,
 }
 
-impl MouseButtonSpec {
-    pub fn to_egui(self) -> egui::PointerButton {
+impl DragAction {
+    pub const ALL: [Self; 3] = [Self::SelectText, Self::Pan, Self::None];
+
+    pub fn label(self) -> &'static str {
         match self {
-            Self::Left => egui::PointerButton::Primary,
-            Self::Middle => egui::PointerButton::Middle,
-            Self::Right => egui::PointerButton::Secondary,
+            Self::SelectText => "Select Text",
+            Self::Pan => "Pan / Drag",
+            Self::None => "Disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SideButtonAction {
+    NavigateBack,
+    NavigateForward,
+    PrevPage,
+    NextPage,
+    ZoomOut,
+    ZoomIn,
+    CycleTheme,
+    ToggleToc,
+    None,
+}
+
+impl SideButtonAction {
+    pub const ALL: [Self; 9] = [
+        Self::NavigateBack,
+        Self::NavigateForward,
+        Self::PrevPage,
+        Self::NextPage,
+        Self::ZoomOut,
+        Self::ZoomIn,
+        Self::CycleTheme,
+        Self::ToggleToc,
+        Self::None,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NavigateBack => "Navigate Back (Link History)",
+            Self::NavigateForward => "Navigate Forward (Link History)",
+            Self::PrevPage => "Previous Page",
+            Self::NextPage => "Next Page",
+            Self::ZoomOut => "Zoom Out",
+            Self::ZoomIn => "Zoom In",
+            Self::CycleTheme => "Cycle Theme",
+            Self::ToggleToc => "Toggle TOC",
+            Self::None => "Disabled",
         }
     }
 }
@@ -105,6 +179,26 @@ pub enum WheelAction {
     None,
 }
 
+impl WheelAction {
+    pub const ALL: [Self; 5] = [
+        Self::Scroll,
+        Self::HorizontalScroll,
+        Self::Zoom,
+        Self::Page,
+        Self::None,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Scroll => "Scroll",
+            Self::HorizontalScroll => "Horizontal Scroll",
+            Self::Zoom => "Zoom",
+            Self::Page => "Change Page",
+            Self::None => "Disabled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DoubleClickAction {
@@ -114,11 +208,32 @@ pub enum DoubleClickAction {
     None,
 }
 
+impl DoubleClickAction {
+    pub const ALL: [Self; 4] = [
+        Self::FitWidth,
+        Self::FitPage,
+        Self::ToggleZoom,
+        Self::None,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FitWidth => "Fit Width",
+            Self::FitPage => "Fit Page",
+            Self::ToggleZoom => "Toggle Fit Width / Page",
+            Self::None => "Disabled",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MouseConfig {
-    pub pan_button: MouseButtonSpec,
-    pub select_button: MouseButtonSpec,
+    pub left_drag: DragAction,
+    pub middle_drag: DragAction,
+    pub right_drag: DragAction,
+    pub back_button: SideButtonAction,
+    pub forward_button: SideButtonAction,
     pub wheel_action: WheelAction,
     pub ctrl_wheel_action: WheelAction,
     pub shift_wheel_action: WheelAction,
@@ -131,8 +246,11 @@ pub struct MouseConfig {
 impl Default for MouseConfig {
     fn default() -> Self {
         Self {
-            pan_button: MouseButtonSpec::Left,
-            select_button: MouseButtonSpec::Left,
+            left_drag: DragAction::SelectText,
+            middle_drag: DragAction::Pan,
+            right_drag: DragAction::Pan,
+            back_button: SideButtonAction::NavigateBack,
+            forward_button: SideButtonAction::NavigateForward,
             wheel_action: WheelAction::Scroll,
             ctrl_wheel_action: WheelAction::Zoom,
             shift_wheel_action: WheelAction::HorizontalScroll,
@@ -163,6 +281,7 @@ pub struct ShortcutConfig {
     pub find: Vec<String>,
     pub find_next: Vec<String>,
     pub find_prev: Vec<String>,
+    pub open_settings: Vec<String>,
     pub open_file: Vec<String>,
     pub quit: Vec<String>,
 }
@@ -186,6 +305,7 @@ impl Default for ShortcutConfig {
             find: vec!["Ctrl+F".into(), "Slash".into()],
             find_next: vec!["n".into(), "F3".into()],
             find_prev: vec!["Shift+N".into(), "Shift+F3".into()],
+            open_settings: vec!["Ctrl+Comma".into()],
             open_file: vec!["Ctrl+O".into()],
             quit: vec!["Ctrl+Q".into(), "q".into()],
         }
@@ -210,6 +330,7 @@ pub enum Action {
     Find,
     FindNext,
     FindPrev,
+    OpenSettings,
     OpenFile,
     Quit,
 }
@@ -241,6 +362,7 @@ impl ShortcutConfig {
             (&self.find, Action::Find),
             (&self.find_next, Action::FindNext),
             (&self.find_prev, Action::FindPrev),
+            (&self.open_settings, Action::OpenSettings),
             (&self.open_file, Action::OpenFile),
             (&self.quit, Action::Quit),
         ];
@@ -342,6 +464,7 @@ fn parse_key(name: &str) -> Option<egui::Key> {
         "equals" | "=" => Some(Key::Equals),
         "minus" | "-" => Some(Key::Minus),
         "slash" | "/" => Some(Key::Slash),
+        "comma" | "," => Some(Key::Comma),
         "f1" => Some(Key::F1),
         "f2" => Some(Key::F2),
         "f3" => Some(Key::F3),
@@ -361,7 +484,14 @@ mod tests {
         let serialized = toml::to_string_pretty(&cfg).expect("serialize default config");
         let parsed: Config = toml::from_str(&serialized).expect("deserialize default config");
         assert_eq!(parsed.theme, "light");
-        assert_eq!(parsed.mouse.pan_button, MouseButtonSpec::Left);
+        assert_eq!(parsed.mouse.left_drag, DragAction::SelectText);
+        assert_eq!(parsed.mouse.middle_drag, DragAction::Pan);
+        assert_eq!(parsed.mouse.right_drag, DragAction::Pan);
+        assert_eq!(parsed.mouse.back_button, SideButtonAction::NavigateBack);
+        assert_eq!(
+            parsed.mouse.forward_button,
+            SideButtonAction::NavigateForward
+        );
         assert!(!parsed.shortcuts.compile().is_empty());
     }
 

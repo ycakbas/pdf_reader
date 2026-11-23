@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use eframe::egui_wgpu;
 
-use crate::config::{Action, Config, DoubleClickAction, KeyBinding, WheelAction};
+use crate::config::{
+    Action, Config, DefaultFitMode, DoubleClickAction, DragAction, KeyBinding, SideButtonAction,
+    WheelAction,
+};
 use crate::pdf::{
     BookmarkNode, LinkTarget, MAX_RENDER_WIDTH_PX, MatchRectPt, OpenDocument, PageLink,
     SearchMatch, init_pdfium,
@@ -24,11 +27,27 @@ enum FitMode {
     FitPage,
 }
 
+impl From<DefaultFitMode> for FitMode {
+    fn from(m: DefaultFitMode) -> Self {
+        match m {
+            DefaultFitMode::FitWidth => Self::FitWidth,
+            DefaultFitMode::FitPage => Self::FitPage,
+            DefaultFitMode::Manual => Self::Manual,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DragMode {
     None,
     Pan,
     SelectText,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsTab {
+    General,
+    Mouse,
 }
 
 struct TextSelection {
@@ -116,7 +135,6 @@ impl PageCache {
     ) -> anyhow::Result<()> {
         let mut rendered = doc.render_page(page_index, clamped_target_width_px)?;
 
-        // Remove any previous GPU texture for this page before replacing it.
         if let Some(old) = self.entries.remove(&page_index)
             && let (Some(rs), Some(old_key)) = (wgpu_state, old.gpu_key)
         {
@@ -126,7 +144,6 @@ impl PageCache {
         let entry = if let Some(rs) = wgpu_state {
             let gpu_key = self.next_gpu_key;
             self.next_gpu_key = self.next_gpu_key.wrapping_add(1);
-            // Upload raw RGBA once; the WGSL fragment shader applies theming on the GPU.
             PdfShaderResources::upload_page(
                 rs,
                 gpu_key,
@@ -185,6 +202,7 @@ impl PageCache {
 
 pub struct PdfReaderApp {
     config: Config,
+    config_path: Option<PathBuf>,
     bindings: Vec<KeyBinding>,
     themes: Vec<ResolvedTheme>,
     active_theme_idx: usize,
@@ -195,19 +213,22 @@ pub struct PdfReaderApp {
 
     current_page: usize,
     nav_back_stack: Vec<usize>,
+    nav_forward_stack: Vec<usize>,
     zoom: f32,
     zoom_settle_deadline: Option<Instant>,
     fit_mode: FitMode,
     continuous_scroll: bool,
-    /// Horizontal pan offset relative to centered page(s) in logical pixels.
     scroll_x: f32,
-    /// Vertical scroll offset from top of document in logical pixels (continuous mode),
-    /// or vertical pan offset from center (single-page mode).
     scroll_y: f32,
     last_canvas_size: egui::Vec2,
 
     show_toolbar: bool,
     show_toc: bool,
+
+    // Settings popup state
+    settings_open: bool,
+    settings_tab: SettingsTab,
+    settings_status: Option<String>,
 
     // Search state
     search_open: bool,
@@ -230,6 +251,7 @@ impl PdfReaderApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         config: Config,
+        config_path: Option<PathBuf>,
         initial_file: Option<PathBuf>,
         initial_page: Option<usize>,
     ) -> Self {
@@ -246,10 +268,12 @@ impl PdfReaderApp {
             .unwrap_or(0);
         let show_toolbar = config.show_toolbar;
         let continuous_scroll = config.continuous_scroll;
+        let fit_mode = FitMode::from(config.default_fit_mode);
         let status_error = init_pdfium().err().map(|e| e.to_string());
 
         let mut app = Self {
             config,
+            config_path,
             bindings,
             themes,
             active_theme_idx,
@@ -258,15 +282,19 @@ impl PdfReaderApp {
             status_error,
             current_page: 0,
             nav_back_stack: Vec::new(),
+            nav_forward_stack: Vec::new(),
             zoom: 1.0,
             zoom_settle_deadline: None,
-            fit_mode: FitMode::FitWidth,
+            fit_mode,
             continuous_scroll,
             scroll_x: 0.0,
             scroll_y: 0.0,
             last_canvas_size: egui::vec2(1000.0, 800.0),
             show_toolbar,
             show_toc: false,
+            settings_open: false,
+            settings_tab: SettingsTab::Mouse,
+            settings_status: None,
             search_open: false,
             search_focus_requested: false,
             search_query: String::new(),
@@ -305,6 +333,7 @@ impl PdfReaderApp {
                 self.cache.clear(self.wgpu_state.as_ref());
                 self.links_cache.clear();
                 self.nav_back_stack.clear();
+                self.nav_forward_stack.clear();
                 self.selection = None;
                 self.drag_mode = DragMode::None;
                 self.search_matches.clear();
@@ -330,7 +359,6 @@ impl PdfReaderApp {
         }
     }
 
-    /// Y-offset (in logical pixels) of the top of `page_index` in continuous scroll mode.
     fn page_top_y(&self, page_index: usize) -> f32 {
         let Some(doc) = &self.doc else {
             return CANVAS_MARGIN;
@@ -342,7 +370,6 @@ impl PdfReaderApp {
         y
     }
 
-    /// Total document height (in logical pixels) in continuous scroll mode.
     fn total_doc_height(&self) -> f32 {
         let Some(doc) = &self.doc else {
             return 0.0;
@@ -360,7 +387,6 @@ impl PdfReaderApp {
         h
     }
 
-    /// Clamp horizontal and vertical scroll/pan so pages cannot be dragged off-screen.
     fn clamp_scroll(&mut self, canvas_size: egui::Vec2) {
         let Some(doc) = &self.doc else {
             self.scroll_x = 0.0;
@@ -413,17 +439,25 @@ impl PdfReaderApp {
             if self.nav_back_stack.len() > 64 {
                 self.nav_back_stack.remove(0);
             }
+            self.nav_forward_stack.clear();
         }
         self.goto_page(target_page);
     }
 
     fn navigate_back(&mut self) {
         if let Some(prev) = self.nav_back_stack.pop() {
+            self.nav_forward_stack.push(self.current_page);
             self.goto_page(prev);
         }
     }
 
-    /// Zoom to `new_zoom` while keeping the document point under `anchor_in_canvas` fixed.
+    fn navigate_forward(&mut self) {
+        if let Some(next) = self.nav_forward_stack.pop() {
+            self.nav_back_stack.push(self.current_page);
+            self.goto_page(next);
+        }
+    }
+
     fn zoom_at(&mut self, new_zoom: f32, anchor_in_canvas: egui::Vec2, canvas_size: egui::Vec2) {
         let old_zoom = self.zoom;
         let clamped = new_zoom.clamp(0.1, 10.0);
@@ -447,6 +481,31 @@ impl PdfReaderApp {
             self.zoom = clamped;
         }
         self.clamp_scroll(canvas_size);
+    }
+
+    fn handle_side_button(&mut self, action: SideButtonAction) {
+        let center = self.last_canvas_size * 0.5;
+        let canvas_size = self.last_canvas_size;
+        match action {
+            SideButtonAction::NavigateBack => self.navigate_back(),
+            SideButtonAction::NavigateForward => self.navigate_forward(),
+            SideButtonAction::PrevPage => self.goto_page(self.current_page.saturating_sub(1)),
+            SideButtonAction::NextPage => self.goto_page(self.current_page.saturating_add(1)),
+            SideButtonAction::ZoomOut => {
+                self.zoom_at(self.zoom / self.config.mouse.zoom_step, center, canvas_size);
+            }
+            SideButtonAction::ZoomIn => {
+                self.zoom_at(self.zoom * self.config.mouse.zoom_step, center, canvas_size);
+            }
+            SideButtonAction::CycleTheme => {
+                self.active_theme_idx = (self.active_theme_idx + 1) % self.themes.len();
+                self.config.theme = self.active_theme().name.clone();
+            }
+            SideButtonAction::ToggleToc => {
+                self.show_toc = !self.show_toc;
+            }
+            SideButtonAction::None => {}
+        }
     }
 
     fn run_search(&mut self) {
@@ -530,6 +589,7 @@ impl PdfReaderApp {
             }
             Action::CycleTheme => {
                 self.active_theme_idx = (self.active_theme_idx + 1) % self.themes.len();
+                self.config.theme = self.active_theme().name.clone();
             }
             Action::ToggleToolbar => {
                 self.show_toolbar = !self.show_toolbar;
@@ -540,6 +600,7 @@ impl PdfReaderApp {
             Action::ToggleContinuous => {
                 let page = self.current_page;
                 self.continuous_scroll = !self.continuous_scroll;
+                self.config.continuous_scroll = self.continuous_scroll;
                 self.goto_page(page);
             }
             Action::Find => {
@@ -548,6 +609,10 @@ impl PdfReaderApp {
             }
             Action::FindNext => self.step_search(true),
             Action::FindPrev => self.step_search(false),
+            Action::OpenSettings => {
+                self.settings_open = !self.settings_open;
+                self.settings_status = None;
+            }
             Action::OpenFile => self.pick_and_open_file(),
             Action::Quit => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -557,6 +622,20 @@ impl PdfReaderApp {
 
     fn process_shortcuts(&mut self, ctx: &egui::Context) {
         let typing = ctx.egui_wants_keyboard_input();
+
+        // Mouse side buttons (Back / Forward) work anywhere in the window
+        let (back_pressed, forward_pressed) = ctx.input(|i| {
+            (
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+            )
+        });
+        if back_pressed {
+            self.handle_side_button(self.config.mouse.back_button);
+        }
+        if forward_pressed {
+            self.handle_side_button(self.config.mouse.forward_button);
+        }
 
         // Copy selected text with Ctrl+C / Cmd+C when not typing in an input box
         if !typing
@@ -568,13 +647,23 @@ impl PdfReaderApp {
             return;
         }
 
-        // Alt+Left navigates back after clicking an internal PDF link
-        if !typing && ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
-            self.navigate_back();
-            return;
+        // Alt+Left / Alt+Right for link navigation history
+        if !typing {
+            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft)) {
+                self.navigate_back();
+                return;
+            }
+            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::ArrowRight)) {
+                self.navigate_forward();
+                return;
+            }
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.settings_open {
+                self.settings_open = false;
+                return;
+            }
             if self.search_open {
                 self.search_open = false;
                 return;
@@ -669,6 +758,15 @@ impl PdfReaderApp {
                 self.navigate_back();
             }
 
+            if !self.nav_forward_stack.is_empty()
+                && ui
+                    .button("Fwd")
+                    .on_hover_text("Go forward in history (Alt+Right)")
+                    .clicked()
+            {
+                self.navigate_forward();
+            }
+
             ui.separator();
 
             if ui.button("<").clicked() {
@@ -710,6 +808,7 @@ impl PdfReaderApp {
             {
                 let page = self.current_page;
                 self.continuous_scroll = !self.continuous_scroll;
+                self.config.continuous_scroll = self.continuous_scroll;
                 self.goto_page(page);
             }
 
@@ -725,18 +824,254 @@ impl PdfReaderApp {
                             .clicked()
                         {
                             self.active_theme_idx = idx;
+                            self.config.theme = theme.name.clone();
                         }
                     }
                 });
 
-            if let Some(doc) = &self.doc
-                && let Some(name) = doc.path.file_name().and_then(|n| n.to_str())
-            {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.settings_open, "Settings")
+                    .on_hover_text("Configure mouse and general settings (Ctrl+,)")
+                    .clicked()
+                {
+                    self.settings_open = !self.settings_open;
+                    self.settings_status = None;
+                }
+
+                if let Some(doc) = &self.doc
+                    && let Some(name) = doc.path.file_name().and_then(|n| n.to_str())
+                {
                     ui.weak(name);
-                });
-            }
+                }
+            });
         });
+    }
+
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+
+        let mut open = self.settings_open;
+        let mut close_requested = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::General, "General");
+                    ui.selectable_value(&mut self.settings_tab, SettingsTab::Mouse, "Mouse");
+                });
+                ui.separator();
+
+                match self.settings_tab {
+                    SettingsTab::General => {
+                        egui::Grid::new("general_settings_grid")
+                            .num_columns(2)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("PDF Theme:");
+                                let cur_name = self.active_theme().name.clone();
+                                egui::ComboBox::from_id_salt("settings_theme")
+                                    .selected_text(&cur_name)
+                                    .show_ui(ui, |ui| {
+                                        for (idx, theme) in self.themes.iter().enumerate() {
+                                            if ui
+                                                .selectable_label(
+                                                    idx == self.active_theme_idx,
+                                                    &theme.name,
+                                                )
+                                                .clicked()
+                                            {
+                                                self.active_theme_idx = idx;
+                                                self.config.theme = theme.name.clone();
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Default Fit Mode:");
+                                egui::ComboBox::from_id_salt("settings_fit_mode")
+                                    .selected_text(self.config.default_fit_mode.label())
+                                    .show_ui(ui, |ui| {
+                                        for mode in [
+                                            DefaultFitMode::FitWidth,
+                                            DefaultFitMode::FitPage,
+                                            DefaultFitMode::Manual,
+                                        ] {
+                                            if ui
+                                                .selectable_value(
+                                                    &mut self.config.default_fit_mode,
+                                                    mode,
+                                                    mode.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.fit_mode = FitMode::from(mode);
+                                            }
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Continuous Scroll:");
+                                let prev_cont = self.config.continuous_scroll;
+                                ui.checkbox(&mut self.config.continuous_scroll, "");
+                                if self.config.continuous_scroll != prev_cont {
+                                    let page = self.current_page;
+                                    self.continuous_scroll = self.config.continuous_scroll;
+                                    self.goto_page(page);
+                                }
+                                ui.end_row();
+
+                                ui.label("Page Gap (px):");
+                                ui.add(
+                                    egui::Slider::new(&mut self.config.page_gap, 0.0..=48.0)
+                                        .step_by(1.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Show Toolbar on Startup:");
+                                ui.checkbox(&mut self.config.show_toolbar, "");
+                                ui.end_row();
+                            });
+                    }
+                    SettingsTab::Mouse => {
+                        egui::Grid::new("mouse_settings_grid")
+                            .num_columns(2)
+                            .spacing([16.0, 8.0])
+                            .show(ui, |ui| {
+                                drag_action_row(
+                                    ui,
+                                    "Left Drag:",
+                                    "settings_left_drag",
+                                    &mut self.config.mouse.left_drag,
+                                );
+                                drag_action_row(
+                                    ui,
+                                    "Middle Drag:",
+                                    "settings_middle_drag",
+                                    &mut self.config.mouse.middle_drag,
+                                );
+                                drag_action_row(
+                                    ui,
+                                    "Right Drag:",
+                                    "settings_right_drag",
+                                    &mut self.config.mouse.right_drag,
+                                );
+                                side_button_row(
+                                    ui,
+                                    "Mouse Back Button:",
+                                    "settings_back_btn",
+                                    &mut self.config.mouse.back_button,
+                                );
+                                side_button_row(
+                                    ui,
+                                    "Mouse Forward Button:",
+                                    "settings_fwd_btn",
+                                    &mut self.config.mouse.forward_button,
+                                );
+                                wheel_action_row(
+                                    ui,
+                                    "Mouse Wheel:",
+                                    "settings_wheel",
+                                    &mut self.config.mouse.wheel_action,
+                                );
+                                wheel_action_row(
+                                    ui,
+                                    "Ctrl + Wheel:",
+                                    "settings_ctrl_wheel",
+                                    &mut self.config.mouse.ctrl_wheel_action,
+                                );
+                                wheel_action_row(
+                                    ui,
+                                    "Shift + Wheel:",
+                                    "settings_shift_wheel",
+                                    &mut self.config.mouse.shift_wheel_action,
+                                );
+
+                                ui.label("Double Click:");
+                                egui::ComboBox::from_id_salt("settings_dbl_click")
+                                    .selected_text(self.config.mouse.double_click_action.label())
+                                    .show_ui(ui, |ui| {
+                                        for act in DoubleClickAction::ALL {
+                                            ui.selectable_value(
+                                                &mut self.config.mouse.double_click_action,
+                                                act,
+                                                act.label(),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Scroll Speed:");
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.config.mouse.scroll_speed,
+                                        0.2..=4.0,
+                                    )
+                                    .fixed_decimals(2),
+                                );
+                                ui.end_row();
+
+                                ui.label("Zoom Step:");
+                                ui.add(
+                                    egui::Slider::new(&mut self.config.mouse.zoom_step, 1.05..=1.5)
+                                        .fixed_decimals(2),
+                                );
+                                ui.end_row();
+
+                                ui.label("Invert Scroll:");
+                                ui.checkbox(&mut self.config.mouse.invert_scroll, "");
+                                ui.end_row();
+                            });
+
+                        ui.add_space(4.0);
+                        ui.weak("Tip: Hold Space + Left-drag anytime to pan temporarily.");
+                    }
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save to config.toml").clicked() {
+                        match self.config.save(self.config_path.as_deref()) {
+                            Ok(path) => {
+                                self.settings_status = Some(format!("Saved to {}", path.display()));
+                            }
+                            Err(err) => {
+                                self.settings_status = Some(format!("Save failed: {err}"));
+                            }
+                        }
+                    }
+
+                    if ui.button("Reset Defaults").clicked() {
+                        let defaults = Config::default();
+                        self.config.mouse = defaults.mouse;
+                        self.config.continuous_scroll = defaults.continuous_scroll;
+                        self.config.page_gap = defaults.page_gap;
+                        self.config.show_toolbar = defaults.show_toolbar;
+                        self.config.default_fit_mode = defaults.default_fit_mode;
+                        self.continuous_scroll = self.config.continuous_scroll;
+                        self.fit_mode = FitMode::from(self.config.default_fit_mode);
+                        self.settings_status = Some("Reset to defaults (click Save to persist)".into());
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+
+                if let Some(status) = &self.settings_status {
+                    ui.add_space(4.0);
+                    ui.weak(status);
+                }
+            });
+
+        self.settings_open = open && !close_requested;
     }
 
     fn draw_search_bar(&mut self, ui: &mut egui::Ui) {
@@ -941,7 +1276,6 @@ impl PdfReaderApp {
         }
         self.clamp_scroll(rect.size());
 
-        // Compute visible pages for hit-testing (links & text selection) before handling drag/click
         let visible_pages = self.compute_visible_pages(rect);
         for &(page_idx, _) in &visible_pages {
             self.ensure_links_loaded(page_idx);
@@ -973,20 +1307,22 @@ impl PdfReaderApp {
             });
 
         // Update cursor icon & link tooltip
-        if let Some((_, ref link, _)) = hovered_link {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            let tip = match &link.target {
-                LinkTarget::InternalPage(p) => format!("Go to page {}", p + 1),
-                LinkTarget::ExternalUri(uri) => uri.clone(),
-            };
-            response.clone().on_hover_text(tip);
-        } else if self.drag_mode == DragMode::Pan {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        } else if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt
-            && let Some(doc) = &self.doc
-            && doc.char_index_at(page_idx, x_pt, y_pt, 6.0).is_some()
-        {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        if response.hovered() {
+            if let Some((_, ref link, _)) = hovered_link {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let tip = match &link.target {
+                    LinkTarget::InternalPage(p) => format!("Go to page {}", p + 1),
+                    LinkTarget::ExternalUri(uri) => uri.clone(),
+                };
+                response.clone().on_hover_text(tip);
+            } else if self.drag_mode == DragMode::Pan {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            } else if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt
+                && let Some(doc) = &self.doc
+                && doc.char_index_at(page_idx, x_pt, y_pt, 6.0, 6.0).is_some()
+            {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
         }
 
         // Click handling: open link or clear selection
@@ -1003,34 +1339,69 @@ impl PdfReaderApp {
             }
         }
 
-        // Drag start: choose between Text Selection and Panning
-        let pan_btn = self.config.mouse.pan_button.to_egui();
-        let select_btn = self.config.mouse.select_button.to_egui();
+        // Drag start: dispatch based on configured per-button DragAction (Space + Left always pans)
         let space_held = ui.ctx().input(|i| i.key_down(egui::Key::Space));
-
         if response.drag_started() {
-            let started_select = response.drag_started_by(select_btn);
-            let started_pan = response.drag_started_by(pan_btn);
+            let drag_action = if response.drag_started_by(egui::PointerButton::Primary) {
+                if space_held {
+                    DragAction::Pan
+                } else {
+                    self.config.mouse.left_drag
+                }
+            } else if response.drag_started_by(egui::PointerButton::Middle) {
+                self.config.mouse.middle_drag
+            } else if response.drag_started_by(egui::PointerButton::Secondary) {
+                self.config.mouse.right_drag
+            } else {
+                DragAction::None
+            };
 
-            if started_select && !space_held && hovered_link.is_none() {
-                if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt
-                    && let Some(doc) = &self.doc
-                    && let Some(char_idx) = doc.char_index_at(page_idx, x_pt, y_pt, 10.0)
-                {
-                    let (rects, text) = doc.selection_rects_and_text(page_idx, char_idx, char_idx);
-                    self.selection = Some(TextSelection {
-                        page_index: page_idx,
-                        anchor_char: char_idx,
-                        head_char: char_idx,
-                        rects,
-                        text,
-                    });
-                    self.drag_mode = DragMode::SelectText;
-                } else if started_pan {
+            match drag_action {
+                DragAction::Pan => {
                     self.drag_mode = DragMode::Pan;
                 }
-            } else if started_pan || (space_held && started_select) {
-                self.drag_mode = DragMode::Pan;
+                DragAction::SelectText => {
+                    // Use press origin if available so selection starts right where the user pressed
+                    let press_pos = ui
+                        .ctx()
+                        .input(|i| i.pointer.press_origin())
+                        .or(hover_pos);
+                    let start_pt = press_pos.and_then(|pos| {
+                        visible_pages.iter().find_map(|&(page_idx, page_rect)| {
+                            if page_rect.contains(pos) {
+                                let x_pt = (pos.x - page_rect.min.x) / self.zoom;
+                                let y_pt = (pos.y - page_rect.min.y) / self.zoom;
+                                Some((page_idx, x_pt, y_pt))
+                            } else {
+                                None
+                            }
+                        })
+                    });
+
+                    if let Some((page_idx, x_pt, y_pt)) = start_pt
+                        && let Some(doc) = &self.doc
+                        && let Some(char_idx) = doc
+                            .char_index_at(page_idx, x_pt, y_pt, 16.0, 16.0)
+                            .or_else(|| doc.char_index_at(page_idx, x_pt, y_pt, 80.0, 24.0))
+                    {
+                        let (rects, text) =
+                            doc.selection_rects_and_text(page_idx, char_idx, char_idx);
+                        self.selection = Some(TextSelection {
+                            page_index: page_idx,
+                            anchor_char: char_idx,
+                            head_char: char_idx,
+                            rects,
+                            text,
+                        });
+                        self.drag_mode = DragMode::SelectText;
+                    } else {
+                        self.selection = None;
+                        self.drag_mode = DragMode::None;
+                    }
+                }
+                DragAction::None => {
+                    self.drag_mode = DragMode::None;
+                }
             }
         }
 
@@ -1056,9 +1427,14 @@ impl PdfReaderApp {
                     && let Some(&(_, page_rect)) =
                         visible_pages.iter().find(|&&(idx, _)| idx == sel.page_index)
                 {
-                    let x_pt = ((pos.x - page_rect.min.x) / self.zoom).clamp(0.0, page_rect.width() / self.zoom);
-                    let y_pt = ((pos.y - page_rect.min.y) / self.zoom).clamp(0.0, page_rect.height() / self.zoom);
-                    if let Some(head) = doc.char_index_at(sel.page_index, x_pt, y_pt, 24.0)
+                    let x_pt = ((pos.x - page_rect.min.x) / self.zoom)
+                        .clamp(0.0, page_rect.width() / self.zoom);
+                    let y_pt = ((pos.y - page_rect.min.y) / self.zoom)
+                        .clamp(0.0, page_rect.height() / self.zoom);
+                    let found = doc
+                        .char_index_at(sel.page_index, x_pt, y_pt, 16.0, 16.0)
+                        .or_else(|| doc.char_index_at(sel.page_index, x_pt, y_pt, 120.0, 24.0));
+                    if let Some(head) = found
                         && head != sel.head_char
                     {
                         sel.head_char = head;
@@ -1164,7 +1540,7 @@ impl PdfReaderApp {
         // Recompute visible pages after scroll/zoom updates
         let visible_pages = self.compute_visible_pages(rect);
 
-        // Check if zoom is still actively changing (debounce high-res re-render)
+        // Debounce high-res re-render while actively zooming
         let now = Instant::now();
         let is_zooming = match self.zoom_settle_deadline {
             Some(deadline) if now < deadline => {
@@ -1187,7 +1563,6 @@ impl PdfReaderApp {
             let clamped_target_w =
                 ((page_rect.width() * ppp).round() as i32).clamp(64, MAX_RENDER_WIDTH_PX);
 
-            // During active zoom, keep scaling the cached GPU texture at 60/120fps without re-rendering!
             let should_render = if is_zooming && self.cache.has_page(page_idx) {
                 false
             } else {
@@ -1301,7 +1676,7 @@ impl PdfReaderApp {
             }
         }
 
-        // Pre-render at most 1 adjacent page when idle (not actively zooming)
+        // Pre-render at most 1 adjacent page when idle
         if !is_zooming
             && let (Some(doc), Some(&(first_vis, _)), Some(&(last_vis, _))) =
                 (&self.doc, visible_pages.first(), visible_pages.last())
@@ -1330,6 +1705,42 @@ impl PdfReaderApp {
             }
         }
     }
+}
+
+fn drag_action_row(ui: &mut egui::Ui, label: &str, id: &str, value: &mut DragAction) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for act in DragAction::ALL {
+                ui.selectable_value(value, act, act.label());
+            }
+        });
+    ui.end_row();
+}
+
+fn side_button_row(ui: &mut egui::Ui, label: &str, id: &str, value: &mut SideButtonAction) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for act in SideButtonAction::ALL {
+                ui.selectable_value(value, act, act.label());
+            }
+        });
+    ui.end_row();
+}
+
+fn wheel_action_row(ui: &mut egui::Ui, label: &str, id: &str, value: &mut WheelAction) {
+    ui.label(label);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for act in WheelAction::ALL {
+                ui.selectable_value(value, act, act.label());
+            }
+        });
+    ui.end_row();
 }
 
 fn draw_bookmark_node(
@@ -1399,5 +1810,7 @@ impl eframe::App for PdfReaderApp {
             .show(ui, |ui| {
                 self.draw_canvas(ui);
             });
+
+        self.draw_settings_window(&ctx);
     }
 }
