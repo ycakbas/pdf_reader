@@ -325,13 +325,6 @@ impl PdfShaderResources {
             res.entries.remove(&key);
         }
     }
-
-    pub fn clear_pages(render_state: &egui_wgpu::RenderState) {
-        let mut renderer = render_state.renderer.write();
-        if let Some(res) = renderer.callback_resources.get_mut::<Self>() {
-            res.entries.clear();
-        }
-    }
 }
 
 struct PdfPageCallback {

@@ -27,6 +27,48 @@ impl DefaultFitMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TabBarVisibility {
+    Always,
+    MultipleOnly,
+    Never,
+}
+
+impl TabBarVisibility {
+    pub const ALL: [Self; 3] = [Self::Always, Self::MultipleOnly, Self::Never];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Always => "Always",
+            Self::MultipleOnly => "When Multiple Tabs Open",
+            Self::Never => "Never (Hidden)",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TabConfig {
+    pub visibility: TabBarVisibility,
+    pub middle_click_close: bool,
+    pub focus_new_tab: bool,
+    pub reopen_existing_tab: bool,
+    pub close_window_on_last_tab: bool,
+}
+
+impl Default for TabConfig {
+    fn default() -> Self {
+        Self {
+            visibility: TabBarVisibility::MultipleOnly,
+            middle_click_close: true,
+            focus_new_tab: true,
+            reopen_existing_tab: true,
+            close_window_on_last_tab: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -48,6 +90,8 @@ pub struct Config {
     pub max_render_width: i32,
     /// Enable PDFium LCD subpixel text rendering for crisper text.
     pub lcd_text_rendering: bool,
+    /// Tab bar and multi-document behavior settings.
+    pub tabs: TabConfig,
     /// Mouse behavior settings.
     pub mouse: MouseConfig,
     /// Keyboard shortcut bindings.
@@ -68,6 +112,7 @@ impl Default for Config {
             render_scale: 1.5,
             max_render_width: 4096,
             lcd_text_rendering: true,
+            tabs: TabConfig::default(),
             mouse: MouseConfig::default(),
             shortcuts: ShortcutConfig::default(),
             themes: BTreeMap::new(),
@@ -303,6 +348,9 @@ pub struct ShortcutConfig {
     pub find_prev: Vec<String>,
     pub open_settings: Vec<String>,
     pub open_file: Vec<String>,
+    pub close_tab: Vec<String>,
+    pub next_tab: Vec<String>,
+    pub prev_tab: Vec<String>,
     pub quit: Vec<String>,
 }
 
@@ -329,6 +377,9 @@ impl Default for ShortcutConfig {
             find_prev: vec!["Shift+N".into(), "Shift+F3".into()],
             open_settings: vec!["Ctrl+Comma".into()],
             open_file: vec!["Ctrl+O".into()],
+            close_tab: vec!["Ctrl+W".into()],
+            next_tab: vec!["Ctrl+Tab".into()],
+            prev_tab: vec!["Ctrl+Shift+Tab".into()],
             quit: vec!["Ctrl+Q".into(), "q".into()],
         }
     }
@@ -356,6 +407,9 @@ pub enum Action {
     FindPrev,
     OpenSettings,
     OpenFile,
+    CloseTab,
+    NextTab,
+    PrevTab,
     Quit,
 }
 
@@ -390,6 +444,9 @@ impl ShortcutConfig {
             (&self.find_prev, Action::FindPrev),
             (&self.open_settings, Action::OpenSettings),
             (&self.open_file, Action::OpenFile),
+            (&self.close_tab, Action::CloseTab),
+            (&self.next_tab, Action::NextTab),
+            (&self.prev_tab, Action::PrevTab),
             (&self.quit, Action::Quit),
         ];
 

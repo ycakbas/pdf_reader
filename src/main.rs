@@ -13,14 +13,14 @@ use eframe::egui;
 #[derive(Debug, Parser)]
 #[command(name = "pdf_reader", about = "Ultra-fast cross-platform PDF reader")]
 struct Cli {
-    /// PDF file to open on startup
-    file: Option<PathBuf>,
+    /// PDF file(s) to open on startup
+    files: Vec<PathBuf>,
 
     /// Path to a custom config.toml file
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Initial 1-based page number to jump to
+    /// Initial 1-based page number to jump to (applied to first file)
     #[arg(short, long)]
     page: Option<usize>,
 
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
         cfg.theme = theme_name;
     }
 
-    let initial_file = cli.file;
+    let initial_files = cli.files;
     let initial_page = cli.page.map(|p| p.saturating_sub(1));
     let config_path = cli.config;
 
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
                 cc,
                 cfg,
                 config_path,
-                initial_file,
+                initial_files,
                 initial_page,
             )))
         }),
