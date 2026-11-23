@@ -493,9 +493,10 @@ pub struct PdfReaderApp {
     goto_focus_requested: bool,
     goto_input: String,
 
-    // Scrollbar drag & scroll acceleration state
+    // Scrollbar drag & custom smooth-scroll / acceleration state
     dragging_v_scrollbar: bool,
     dragging_h_scrollbar: bool,
+    pending_scroll: egui::Vec2,
     scroll_accel_boost: f32,
     last_scroll_time: Option<Instant>,
     last_scroll_dir: f32,
@@ -573,6 +574,7 @@ impl PdfReaderApp {
             goto_input: String::new(),
             dragging_v_scrollbar: false,
             dragging_h_scrollbar: false,
+            pending_scroll: egui::Vec2::ZERO,
             scroll_accel_boost: 1.0,
             last_scroll_time: None,
             last_scroll_dir: 0.0,
@@ -719,6 +721,7 @@ impl PdfReaderApp {
             self.pan_start_pointer = None;
             self.dragging_v_scrollbar = false;
             self.dragging_h_scrollbar = false;
+            self.pending_scroll = egui::Vec2::ZERO;
             self.tabs[index].last_thumb_synced_page = None;
         }
     }
@@ -766,6 +769,7 @@ impl PdfReaderApp {
     }
 
     fn goto_page(&mut self, index: usize) {
+        self.pending_scroll = egui::Vec2::ZERO;
         let canvas_size = self.last_canvas_size;
         let cont = self.continuous_scroll;
         let gap = self.config.page_gap;
@@ -2811,6 +2815,7 @@ impl PdfReaderApp {
             match drag_action {
                 DragAction::Pan => {
                     let tab = &self.tabs[self.active_tab];
+                    self.pending_scroll = egui::Vec2::ZERO;
                     self.drag_mode = DragMode::Pan;
                     self.drag_button = started_btn;
                     self.pan_start_pointer = ui
@@ -2936,26 +2941,25 @@ impl PdfReaderApp {
             DragMode::None => {}
         }
 
-        // Mouse wheel + trackpad pinch zoom
+        // Mouse wheel + trackpad pinch zoom (uses raw MouseWheel events + our own smooth integrator
+        // so there is zero end-of-scroll jump and acceleration only triggers on real wheel ticks)
         if ui.rect_contains_pointer(rect) {
-            let (scroll_delta, pinch_delta, modifiers, pointer_pos, raw_wheel_events) =
-                ui.ctx().input(|i| {
-                    let wheel_events: Vec<(egui::MouseWheelUnit, egui::Vec2)> = i
-                        .events
-                        .iter()
-                        .filter_map(|ev| match ev {
-                            egui::Event::MouseWheel { unit, delta, .. } => Some((*unit, *delta)),
-                            _ => None,
-                        })
-                        .collect();
-                    (
-                        i.smooth_scroll_delta,
-                        i.zoom_delta(),
-                        i.modifiers,
-                        i.pointer.hover_pos(),
-                        wheel_events,
-                    )
-                });
+            let (pinch_delta, modifiers, pointer_pos, raw_wheel_events) = ui.ctx().input(|i| {
+                let wheel_events: Vec<(egui::MouseWheelUnit, egui::Vec2)> = i
+                    .events
+                    .iter()
+                    .filter_map(|ev| match ev {
+                        egui::Event::MouseWheel { unit, delta, .. } => Some((*unit, *delta)),
+                        _ => None,
+                    })
+                    .collect();
+                (
+                    i.zoom_delta(),
+                    i.modifiers,
+                    i.pointer.hover_pos(),
+                    wheel_events,
+                )
+            });
 
             let sign = if self.config.mouse.invert_scroll {
                 -1.0
@@ -2963,46 +2967,18 @@ impl PdfReaderApp {
                 1.0
             };
 
-            // Compute exact discrete page-flip steps from raw MouseWheel events
-            // (avoids egui's smooth_scroll_delta tail triggering a second page flip!)
-            let mut wheel_page_steps: i32 = 0;
-            for &(unit, raw_d) in &raw_wheel_events {
-                let dy = raw_d.y * sign;
-                if dy == 0.0 {
-                    continue;
-                }
-                match unit {
-                    egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => {
-                        self.wheel_flip_accum = 0.0;
-                        if dy < 0.0 {
-                            wheel_page_steps += 1;
-                        } else {
-                            wheel_page_steps -= 1;
-                        }
-                    }
-                    egui::MouseWheelUnit::Point => {
-                        self.wheel_flip_accum += dy;
-                        if self.wheel_flip_accum <= -45.0 {
-                            wheel_page_steps += 1;
-                            self.wheel_flip_accum = 0.0;
-                        } else if self.wheel_flip_accum >= 45.0 {
-                            wheel_page_steps -= 1;
-                            self.wheel_flip_accum = 0.0;
-                        }
-                    }
-                }
-            }
-
             let anchor = pointer_pos
                 .map(|p| p - rect.min)
                 .unwrap_or(rect.size() * 0.5);
 
-            if (pinch_delta - 1.0).abs() > 1e-3 {
+            // Trackpad pinch-to-zoom (note: egui also emits zoom_delta on Ctrl+Wheel,
+            // so only apply pinch_delta when no raw MouseWheel events arrived this frame)
+            if raw_wheel_events.is_empty() && (pinch_delta - 1.0).abs() > 1e-3 {
                 let z = self.tabs[self.active_tab].zoom;
                 self.zoom_at(z * pinch_delta, anchor, rect.size());
             }
 
-            if scroll_delta != egui::Vec2::ZERO || wheel_page_steps != 0 {
+            if !raw_wheel_events.is_empty() {
                 let wheel_action = if modifiers.command {
                     self.config.mouse.ctrl_wheel_action
                 } else if modifiers.shift {
@@ -3011,20 +2987,61 @@ impl PdfReaderApp {
                     self.config.mouse.wheel_action
                 };
 
+                let mut wheel_page_steps: i32 = 0;
+                let mut discrete_px = egui::Vec2::ZERO;
+                let mut direct_px = egui::Vec2::ZERO;
+
+                for &(unit, raw_d) in &raw_wheel_events {
+                    let d = raw_d * sign;
+                    match unit {
+                        egui::MouseWheelUnit::Line => {
+                            self.wheel_flip_accum = 0.0;
+                            if d.y < 0.0 {
+                                wheel_page_steps += 1;
+                            } else if d.y > 0.0 {
+                                wheel_page_steps -= 1;
+                            }
+                            discrete_px += d * 40.0;
+                        }
+                        egui::MouseWheelUnit::Page => {
+                            self.wheel_flip_accum = 0.0;
+                            if d.y < 0.0 {
+                                wheel_page_steps += 1;
+                            } else if d.y > 0.0 {
+                                wheel_page_steps -= 1;
+                            }
+                            discrete_px += d * rect.height();
+                        }
+                        egui::MouseWheelUnit::Point => {
+                            self.wheel_flip_accum += d.y;
+                            if self.wheel_flip_accum <= -45.0 {
+                                wheel_page_steps += 1;
+                                self.wheel_flip_accum = 0.0;
+                            } else if self.wheel_flip_accum >= 45.0 {
+                                wheel_page_steps -= 1;
+                                self.wheel_flip_accum = 0.0;
+                            }
+                            direct_px += d;
+                        }
+                    }
+                }
+
+                let total_raw_px = discrete_px + direct_px;
                 let is_scroll_action = matches!(
                     wheel_action,
                     WheelAction::Scroll | WheelAction::HorizontalScroll
                 );
 
+                // Update scroll acceleration ONLY on actual raw wheel events
                 let accel_mult = if is_scroll_action
                     && self.config.mouse.scroll_acceleration
-                    && scroll_delta != egui::Vec2::ZERO
+                    && total_raw_px != egui::Vec2::ZERO
                 {
                     let now = Instant::now();
-                    let dir = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
-                        scroll_delta.y.signum()
+                    let dir = if total_raw_px.y.abs() >= total_raw_px.x.abs() {
+                        total_raw_px.y.signum()
                     } else {
-                        scroll_delta.x.signum()
+                        total_raw_px.x.signum()
                     };
                     let dt = self
                         .last_scroll_time
@@ -3034,9 +3051,9 @@ impl PdfReaderApp {
                     if dt > 0.35 || (dir != 0.0 && dir * self.last_scroll_dir < 0.0) {
                         self.scroll_accel_boost = 1.0;
                     } else {
-                        let decay = (-dt * 3.5).exp();
+                        let decay = (-dt * 3.0).exp();
                         let retained = 1.0 + (self.scroll_accel_boost - 1.0) * decay;
-                        let impulse = 0.22 * self.config.mouse.scroll_accel_strength;
+                        let impulse = 0.35 * self.config.mouse.scroll_accel_strength;
                         let max_mult = self.config.mouse.scroll_accel_max.max(1.0);
                         self.scroll_accel_boost = (retained + impulse).clamp(1.0, max_mult);
                     }
@@ -3050,7 +3067,7 @@ impl PdfReaderApp {
                     1.0
                 };
 
-                let delta = scroll_delta * sign * self.config.mouse.scroll_speed * accel_mult;
+                let speed = self.config.mouse.scroll_speed * accel_mult;
 
                 match wheel_action {
                     WheelAction::Scroll => {
@@ -3061,9 +3078,10 @@ impl PdfReaderApp {
                             let cur = self.tabs[self.active_tab].current_page;
 
                             if (max_y - min_y) <= 1.0 {
-                                // Page fits vertically in the middle: 1 raw wheel tick = 1 page
+                                self.pending_scroll = egui::Vec2::ZERO;
                                 if wheel_page_steps > 0 && cur + 1 < page_count {
-                                    let next = (cur + wheel_page_steps as usize).min(page_count - 1);
+                                    let next =
+                                        (cur + wheel_page_steps as usize).min(page_count - 1);
                                     self.tabs[self.active_tab].goto_page_aligned(
                                         next,
                                         false,
@@ -3082,51 +3100,61 @@ impl PdfReaderApp {
                                     );
                                 }
                             } else {
-                                // Page is taller than viewport: scroll within page, then flip on a raw tick past top/bottom
                                 let tab = &mut self.tabs[self.active_tab];
                                 let at_bottom = tab.scroll_y <= min_y + 1.0;
                                 let at_top = tab.scroll_y >= max_y - 1.0;
 
                                 if wheel_page_steps > 0 && at_bottom && cur + 1 < page_count {
-                                    tab.goto_page_aligned(
-                                        cur + 1,
-                                        false,
-                                        rect.size(),
-                                        cont,
-                                        gap,
-                                    );
+                                    self.pending_scroll = egui::Vec2::ZERO;
+                                    tab.goto_page_aligned(cur + 1, false, rect.size(), cont, gap);
                                 } else if wheel_page_steps < 0 && at_top && cur > 0 {
-                                    tab.goto_page_aligned(
-                                        cur - 1,
-                                        true,
-                                        rect.size(),
-                                        cont,
-                                        gap,
-                                    );
-                                } else if scroll_delta != egui::Vec2::ZERO {
-                                    tab.scroll_x += delta.x;
-                                    tab.scroll_y += delta.y;
-                                    tab.clamp_scroll(rect.size(), cont, gap);
+                                    self.pending_scroll = egui::Vec2::ZERO;
+                                    tab.goto_page_aligned(cur - 1, true, rect.size(), cont, gap);
+                                } else {
+                                    if direct_px != egui::Vec2::ZERO {
+                                        let d = direct_px * speed;
+                                        tab.scroll_x += d.x;
+                                        tab.scroll_y += d.y;
+                                        tab.clamp_scroll(rect.size(), cont, gap);
+                                    }
+                                    if discrete_px != egui::Vec2::ZERO {
+                                        self.pending_scroll += discrete_px * speed;
+                                    }
                                 }
                             }
-                        } else if scroll_delta != egui::Vec2::ZERO {
-                            let tab = &mut self.tabs[self.active_tab];
-                            tab.scroll_x += delta.x;
-                            tab.scroll_y -= delta.y;
-                            tab.clamp_scroll(rect.size(), cont, gap);
+                        } else {
+                            if direct_px != egui::Vec2::ZERO {
+                                let d = direct_px * speed;
+                                let tab = &mut self.tabs[self.active_tab];
+                                tab.scroll_x += d.x;
+                                tab.scroll_y -= d.y;
+                                tab.clamp_scroll(rect.size(), cont, gap);
+                            }
+                            if discrete_px != egui::Vec2::ZERO {
+                                self.pending_scroll += discrete_px * speed;
+                            }
                         }
                     }
                     WheelAction::HorizontalScroll => {
-                        let tab = &mut self.tabs[self.active_tab];
-                        tab.scroll_x += delta.y + delta.x;
-                        tab.clamp_scroll(rect.size(), cont, gap);
+                        if direct_px != egui::Vec2::ZERO {
+                            let d = direct_px * speed;
+                            let tab = &mut self.tabs[self.active_tab];
+                            tab.scroll_x += d.y + d.x;
+                            tab.clamp_scroll(rect.size(), cont, gap);
+                        }
+                        if discrete_px != egui::Vec2::ZERO {
+                            let d = discrete_px * speed;
+                            self.pending_scroll.x += d.y + d.x;
+                        }
                     }
                     WheelAction::Zoom => {
+                        self.pending_scroll = egui::Vec2::ZERO;
                         let z = self.tabs[self.active_tab].zoom;
-                        let factor = (delta.y * 0.004).exp();
+                        let factor = (total_raw_px.y * 0.004).exp();
                         self.zoom_at(z * factor, anchor, rect.size());
                     }
                     WheelAction::Page => {
+                        self.pending_scroll = egui::Vec2::ZERO;
                         let cur = self.tabs[self.active_tab].current_page;
                         if wheel_page_steps > 0 {
                             self.goto_page(cur.saturating_add(wheel_page_steps as usize));
@@ -3136,6 +3164,29 @@ impl PdfReaderApp {
                     }
                     WheelAction::None => {}
                 }
+            }
+        }
+
+        // Smoothly integrate pending discrete wheel scroll with a sub-pixel stop threshold (zero final jump!)
+        if self.pending_scroll != egui::Vec2::ZERO {
+            let dt = ui.ctx().input(|i| i.stable_dt).clamp(0.001, 0.05);
+            let factor = 1.0 - (-dt * 18.0).exp();
+            let step = self.pending_scroll * factor;
+            self.pending_scroll -= step;
+
+            let tab = &mut self.tabs[self.active_tab];
+            tab.scroll_x += step.x;
+            if cont {
+                tab.scroll_y -= step.y;
+            } else {
+                tab.scroll_y += step.y;
+            }
+            tab.clamp_scroll(rect.size(), cont, gap);
+
+            if self.pending_scroll.length() < 0.25 {
+                self.pending_scroll = egui::Vec2::ZERO;
+            } else {
+                ui.ctx().request_repaint();
             }
         }
 
