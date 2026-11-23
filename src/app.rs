@@ -336,9 +336,10 @@ impl TabState {
         self.scroll_y = self.scroll_y.clamp(min_y, max_y);
     }
 
-    fn goto_page(
+    fn goto_page_aligned(
         &mut self,
         index: usize,
+        align_bottom: bool,
         canvas_size: egui::Vec2,
         continuous_scroll: bool,
         page_gap: f32,
@@ -351,10 +352,24 @@ impl TabState {
         if continuous_scroll {
             self.scroll_y = (self.page_top_y(clamped, page_gap) - CANVAS_MARGIN).max(0.0);
         } else {
-            self.scroll_x = 0.0;
-            self.scroll_y = 0.0;
+            let (_, min_y, max_y, _, _) =
+                self.scroll_bounds(canvas_size, continuous_scroll, page_gap);
+            // In single-page mode: +max_y aligns page top with viewport top,
+            // -max_y (min_y) aligns page bottom with viewport bottom,
+            // and both are 0.0 (centered) when the page fits vertically.
+            self.scroll_y = if align_bottom { min_y } else { max_y };
         }
         self.clamp_scroll(canvas_size, continuous_scroll, page_gap);
+    }
+
+    fn goto_page(
+        &mut self,
+        index: usize,
+        canvas_size: egui::Vec2,
+        continuous_scroll: bool,
+        page_gap: f32,
+    ) {
+        self.goto_page_aligned(index, false, canvas_size, continuous_scroll, page_gap);
     }
 
     fn jump_via_link(
@@ -480,6 +495,7 @@ pub struct PdfReaderApp {
     scroll_accel_boost: f32,
     last_scroll_time: Option<Instant>,
     last_scroll_dir: f32,
+    last_page_flip_time: Option<Instant>,
 
     // Settings popup state
     settings_open: bool,
@@ -549,6 +565,7 @@ impl PdfReaderApp {
             scroll_accel_boost: 1.0,
             last_scroll_time: None,
             last_scroll_dir: 0.0,
+            last_page_flip_time: None,
             settings_open: false,
             settings_tab: SettingsTab::Mouse,
             settings_status: None,
@@ -2273,12 +2290,20 @@ impl PdfReaderApp {
                 {
                     let t = ((pos.y - track_rect.min.y - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
                     let tab = &mut self.tabs[self.active_tab];
-                    tab.scroll_y = min_y + t * (max_y - min_y);
+                    tab.scroll_y = if cont {
+                        min_y + t * (max_y - min_y)
+                    } else {
+                        max_y - t * (max_y - min_y)
+                    };
                     tab.clamp_scroll(rect.size(), cont, gap);
                 }
 
                 let tab = &self.tabs[self.active_tab];
-                let t = ((tab.scroll_y - min_y) / (max_y - min_y).max(1.0)).clamp(0.0, 1.0);
+                let t = if cont {
+                    ((tab.scroll_y - min_y) / (max_y - min_y).max(1.0)).clamp(0.0, 1.0)
+                } else {
+                    ((max_y - tab.scroll_y) / (max_y - min_y).max(1.0)).clamp(0.0, 1.0)
+                };
                 let thumb_y = track_rect.min.y + t * travel;
                 let thumb_rect = egui::Rect::from_min_size(
                     egui::pos2(track_rect.min.x + 1.0, thumb_y),
@@ -2908,21 +2933,73 @@ impl PdfReaderApp {
                     WheelAction::Scroll => {
                         let (_, min_y, max_y, _, _) =
                             self.tabs[self.active_tab].scroll_bounds(rect.size(), cont, gap);
-                        if !cont && (max_y - min_y) <= 1.0 {
+                        if !cont {
+                            let now = Instant::now();
+                            let can_flip = self
+                                .last_page_flip_time
+                                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(140));
+                            let page_count = self.tabs[self.active_tab].doc.page_count;
                             let cur = self.tabs[self.active_tab].current_page;
-                            if delta.y < -4.0 {
-                                self.goto_page(cur.saturating_add(1));
-                            } else if delta.y > 4.0 {
-                                self.goto_page(cur.saturating_sub(1));
+
+                            if (max_y - min_y) <= 1.0 {
+                                // Page fits vertically in the middle: one wheel tick switches page
+                                if can_flip && delta.y < -0.5 && cur + 1 < page_count {
+                                    self.tabs[self.active_tab].goto_page_aligned(
+                                        cur + 1,
+                                        false,
+                                        rect.size(),
+                                        cont,
+                                        gap,
+                                    );
+                                    self.last_page_flip_time = Some(now);
+                                } else if can_flip && delta.y > 0.5 && cur > 0 {
+                                    self.tabs[self.active_tab].goto_page_aligned(
+                                        cur - 1,
+                                        true,
+                                        rect.size(),
+                                        cont,
+                                        gap,
+                                    );
+                                    self.last_page_flip_time = Some(now);
+                                }
+                            } else {
+                                // Page is taller than viewport: scroll within page, then flip past top/bottom
+                                let tab = &mut self.tabs[self.active_tab];
+                                let at_bottom = tab.scroll_y <= min_y + 1.0;
+                                let at_top = tab.scroll_y >= max_y - 1.0;
+
+                                if delta.y < -0.5 && at_bottom && cur + 1 < page_count {
+                                    if can_flip {
+                                        tab.goto_page_aligned(
+                                            cur + 1,
+                                            false,
+                                            rect.size(),
+                                            cont,
+                                            gap,
+                                        );
+                                        self.last_page_flip_time = Some(now);
+                                    }
+                                } else if delta.y > 0.5 && at_top && cur > 0 {
+                                    if can_flip {
+                                        tab.goto_page_aligned(
+                                            cur - 1,
+                                            true,
+                                            rect.size(),
+                                            cont,
+                                            gap,
+                                        );
+                                        self.last_page_flip_time = Some(now);
+                                    }
+                                } else {
+                                    tab.scroll_x += delta.x;
+                                    tab.scroll_y += delta.y;
+                                    tab.clamp_scroll(rect.size(), cont, gap);
+                                }
                             }
                         } else {
                             let tab = &mut self.tabs[self.active_tab];
                             tab.scroll_x += delta.x;
-                            if cont {
-                                tab.scroll_y -= delta.y;
-                            } else {
-                                tab.scroll_y += delta.y;
-                            }
+                            tab.scroll_y -= delta.y;
                             tab.clamp_scroll(rect.size(), cont, gap);
                         }
                     }
