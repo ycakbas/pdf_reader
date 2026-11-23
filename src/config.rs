@@ -34,6 +34,8 @@ pub struct Config {
     pub theme: String,
     /// Show the top status/toolbar on startup.
     pub show_toolbar: bool,
+    /// Show overlay scrollbars on the PDF canvas.
+    pub show_scrollbars: bool,
     /// Enable continuous vertical scrolling across pages.
     pub continuous_scroll: bool,
     /// Gap in logical pixels between pages in continuous scroll mode.
@@ -53,6 +55,7 @@ impl Default for Config {
         Self {
             theme: "light".to_string(),
             show_toolbar: true,
+            show_scrollbars: true,
             continuous_scroll: true,
             page_gap: 12.0,
             default_fit_mode: DefaultFitMode::FitWidth,
@@ -277,7 +280,9 @@ pub struct ShortcutConfig {
     pub cycle_theme: Vec<String>,
     pub toggle_toolbar: Vec<String>,
     pub toggle_toc: Vec<String>,
+    pub toggle_thumbnails: Vec<String>,
     pub toggle_continuous: Vec<String>,
+    pub goto_page: Vec<String>,
     pub find: Vec<String>,
     pub find_next: Vec<String>,
     pub find_prev: Vec<String>,
@@ -301,7 +306,9 @@ impl Default for ShortcutConfig {
             cycle_theme: vec!["t".into()],
             toggle_toolbar: vec!["b".into()],
             toggle_toc: vec!["Tab".into()],
+            toggle_thumbnails: vec!["p".into()],
             toggle_continuous: vec!["c".into()],
+            goto_page: vec!["Ctrl+G".into()],
             find: vec!["Ctrl+F".into(), "Slash".into()],
             find_next: vec!["n".into(), "F3".into()],
             find_prev: vec!["Shift+N".into(), "Shift+F3".into()],
@@ -326,7 +333,9 @@ pub enum Action {
     CycleTheme,
     ToggleToolbar,
     ToggleToc,
+    ToggleThumbnails,
     ToggleContinuous,
+    GotoPage,
     Find,
     FindNext,
     FindPrev,
@@ -358,7 +367,9 @@ impl ShortcutConfig {
             (&self.cycle_theme, Action::CycleTheme),
             (&self.toggle_toolbar, Action::ToggleToolbar),
             (&self.toggle_toc, Action::ToggleToc),
+            (&self.toggle_thumbnails, Action::ToggleThumbnails),
             (&self.toggle_continuous, Action::ToggleContinuous),
+            (&self.goto_page, Action::GotoPage),
             (&self.find, Action::Find),
             (&self.find_next, Action::FindNext),
             (&self.find_prev, Action::FindPrev),

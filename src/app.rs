@@ -224,6 +224,14 @@ pub struct PdfReaderApp {
 
     show_toolbar: bool,
     show_toc: bool,
+    show_thumbnails: bool,
+
+    // Fast navigation state
+    toolbar_page_input: String,
+    goto_open: bool,
+    goto_focus_requested: bool,
+    goto_input: String,
+    thumb_cache: HashMap<usize, egui::TextureHandle>,
 
     // Settings popup state
     settings_open: bool,
@@ -292,6 +300,12 @@ impl PdfReaderApp {
             last_canvas_size: egui::vec2(1000.0, 800.0),
             show_toolbar,
             show_toc: false,
+            show_thumbnails: false,
+            toolbar_page_input: String::new(),
+            goto_open: false,
+            goto_focus_requested: false,
+            goto_input: String::new(),
+            thumb_cache: HashMap::new(),
             settings_open: false,
             settings_tab: SettingsTab::Mouse,
             settings_status: None,
@@ -331,6 +345,7 @@ impl PdfReaderApp {
                     .min(doc.page_count.saturating_sub(1));
                 self.doc = Some(doc);
                 self.cache.clear(self.wgpu_state.as_ref());
+                self.thumb_cache.clear();
                 self.links_cache.clear();
                 self.nav_back_stack.clear();
                 self.nav_forward_stack.clear();
@@ -387,11 +402,10 @@ impl PdfReaderApp {
         h
     }
 
-    fn clamp_scroll(&mut self, canvas_size: egui::Vec2) {
+    /// Returns `(max_scroll_x, min_scroll_y, max_scroll_y, total_w, total_h)` for the current document.
+    fn scroll_bounds(&self, canvas_size: egui::Vec2) -> (f32, f32, f32, f32, f32) {
         let Some(doc) = &self.doc else {
-            self.scroll_x = 0.0;
-            self.scroll_y = 0.0;
-            return;
+            return (0.0, 0.0, 0.0, canvas_size.x, canvas_size.y);
         };
 
         let max_page_w_pt = if self.continuous_scroll {
@@ -403,18 +417,24 @@ impl PdfReaderApp {
             doc.page_size_pt(self.current_page).0
         };
 
-        let max_x = ((max_page_w_pt * self.zoom + CANVAS_MARGIN * 2.0) - canvas_size.x).max(0.0)
-            * 0.5;
-        self.scroll_x = self.scroll_x.clamp(-max_x, max_x);
+        let total_w = max_page_w_pt * self.zoom + CANVAS_MARGIN * 2.0;
+        let max_x = (total_w - canvas_size.x).max(0.0) * 0.5;
 
         if self.continuous_scroll {
-            let max_y = (self.total_doc_height() - canvas_size.y).max(0.0);
-            self.scroll_y = self.scroll_y.clamp(0.0, max_y);
+            let total_h = self.total_doc_height();
+            let max_y = (total_h - canvas_size.y).max(0.0);
+            (max_x, 0.0, max_y, total_w, total_h)
         } else {
-            let cur_h = doc.page_size_pt(self.current_page).1 * self.zoom;
-            let max_y = ((cur_h + CANVAS_MARGIN * 2.0) - canvas_size.y).max(0.0) * 0.5;
-            self.scroll_y = self.scroll_y.clamp(-max_y, max_y);
+            let total_h = doc.page_size_pt(self.current_page).1 * self.zoom + CANVAS_MARGIN * 2.0;
+            let max_y = (total_h - canvas_size.y).max(0.0) * 0.5;
+            (max_x, -max_y, max_y, total_w, total_h)
         }
+    }
+
+    fn clamp_scroll(&mut self, canvas_size: egui::Vec2) {
+        let (max_x, min_y, max_y, _, _) = self.scroll_bounds(canvas_size);
+        self.scroll_x = self.scroll_x.clamp(-max_x, max_x);
+        self.scroll_y = self.scroll_y.clamp(min_y, max_y);
     }
 
     fn goto_page(&mut self, index: usize) {
@@ -596,12 +616,26 @@ impl PdfReaderApp {
             }
             Action::ToggleToc => {
                 self.show_toc = !self.show_toc;
+                if self.show_toc {
+                    self.show_thumbnails = false;
+                }
+            }
+            Action::ToggleThumbnails => {
+                self.show_thumbnails = !self.show_thumbnails;
+                if self.show_thumbnails {
+                    self.show_toc = false;
+                }
             }
             Action::ToggleContinuous => {
                 let page = self.current_page;
                 self.continuous_scroll = !self.continuous_scroll;
                 self.config.continuous_scroll = self.continuous_scroll;
                 self.goto_page(page);
+            }
+            Action::GotoPage => {
+                self.goto_open = true;
+                self.goto_focus_requested = true;
+                self.goto_input = (self.current_page + 1).to_string();
             }
             Action::Find => {
                 self.search_open = true;
@@ -660,6 +694,10 @@ impl PdfReaderApp {
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.goto_open {
+                self.goto_open = false;
+                return;
+            }
             if self.settings_open {
                 self.settings_open = false;
                 return;
@@ -736,6 +774,20 @@ impl PdfReaderApp {
                 .clicked()
             {
                 self.show_toc = !self.show_toc;
+                if self.show_toc {
+                    self.show_thumbnails = false;
+                }
+            }
+
+            if ui
+                .selectable_label(self.show_thumbnails, "Pages")
+                .on_hover_text("Toggle page thumbnails sidebar (p)")
+                .clicked()
+            {
+                self.show_thumbnails = !self.show_thumbnails;
+                if self.show_thumbnails {
+                    self.show_toc = false;
+                }
             }
 
             if ui
@@ -774,7 +826,17 @@ impl PdfReaderApp {
             }
             let count = self.page_count();
             if count > 0 {
-                ui.label(format!("{} / {count}", self.current_page + 1));
+                let page_edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.toolbar_page_input).desired_width(38.0),
+                );
+                if !page_edit.has_focus() {
+                    self.toolbar_page_input = (self.current_page + 1).to_string();
+                }
+                if page_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    self.jump_from_input(&self.toolbar_page_input.clone());
+                }
+                ui.label(format!("/ {count}"))
+                    .on_hover_text("Type a page number or press Ctrl+G to jump");
             } else {
                 ui.label("No document");
             }
@@ -936,6 +998,10 @@ impl PdfReaderApp {
                                 ui.label("Show Toolbar on Startup:");
                                 ui.checkbox(&mut self.config.show_toolbar, "");
                                 ui.end_row();
+
+                                ui.label("Show Scrollbars:");
+                                ui.checkbox(&mut self.config.show_scrollbars, "");
+                                ui.end_row();
                             });
                     }
                     SettingsTab::Mouse => {
@@ -1052,6 +1118,7 @@ impl PdfReaderApp {
                         self.config.continuous_scroll = defaults.continuous_scroll;
                         self.config.page_gap = defaults.page_gap;
                         self.config.show_toolbar = defaults.show_toolbar;
+                        self.config.show_scrollbars = defaults.show_scrollbars;
                         self.config.default_fit_mode = defaults.default_fit_mode;
                         self.continuous_scroll = self.config.continuous_scroll;
                         self.fit_mode = FitMode::from(self.config.default_fit_mode);
@@ -1072,6 +1139,338 @@ impl PdfReaderApp {
             });
 
         self.settings_open = open && !close_requested;
+    }
+
+    /// Parse either a 1-based page number (`"42"`) or a percentage (`"50%"`) and jump there.
+    fn jump_from_input(&mut self, raw: &str) {
+        let count = self.page_count();
+        if count == 0 {
+            return;
+        }
+        let s = raw.trim();
+        if let Some(pct_str) = s.strip_suffix('%') {
+            if let Ok(pct) = pct_str.trim().parse::<f32>() {
+                let frac = (pct / 100.0).clamp(0.0, 1.0);
+                let target = ((count.saturating_sub(1)) as f32 * frac).round() as usize;
+                self.jump_via_link(target);
+            }
+        } else if let Ok(page_1based) = s.parse::<usize>() {
+            let target = page_1based.saturating_sub(1).min(count - 1);
+            self.jump_via_link(target);
+        }
+    }
+
+    fn draw_goto_window(&mut self, ctx: &egui::Context) {
+        if !self.goto_open {
+            return;
+        }
+
+        let count = self.page_count();
+        let mut open = self.goto_open;
+        let mut submit = false;
+        let mut close_requested = false;
+
+        egui::Window::new("Go to Page")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 64.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Page (1–{count}) or %:"));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.goto_input)
+                            .desired_width(90.0)
+                            .hint_text("e.g. 42 or 50%"),
+                    );
+                    if self.goto_focus_requested {
+                        resp.request_focus();
+                        self.goto_focus_requested = false;
+                    }
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit = true;
+                    }
+                    if ui.button("Go").clicked() {
+                        submit = true;
+                    }
+                });
+                if count > 1 {
+                    ui.add_space(4.0);
+                    let mut p = self.current_page + 1;
+                    if ui
+                        .add(egui::Slider::new(&mut p, 1..=count).text("Scrub"))
+                        .changed()
+                    {
+                        self.goto_page(p - 1);
+                        self.goto_input = p.to_string();
+                    }
+                }
+                if submit {
+                    self.jump_from_input(&self.goto_input.clone());
+                    close_requested = true;
+                }
+            });
+
+        self.goto_open = open && !close_requested;
+    }
+
+    fn draw_thumbnails_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Pages");
+        ui.separator();
+
+        let count = self.page_count();
+        if count == 0 {
+            ui.weak("No document open.");
+            return;
+        }
+
+        let thumb_w = 136.0_f32;
+        let row_h = 196.0_f32;
+        let mut jump_to: Option<usize> = None;
+        let mut rendered_this_frame = 0_usize;
+        let ctx = ui.ctx().clone();
+
+        egui::ScrollArea::vertical()
+            .id_salt("thumb_scroll")
+            .auto_shrink([false, false])
+            .show_rows(ui, row_h, count, |ui, row_range| {
+                for page_idx in row_range {
+                    // Lazily render at most 2 visible thumbnails per frame so opening stays instant
+                    if !self.thumb_cache.contains_key(&page_idx) && rendered_this_frame < 2 {
+                        if let Some(doc) = &self.doc
+                            && let Ok(rendered) = doc.render_page(page_idx, 160)
+                        {
+                            let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                                [rendered.width, rendered.height],
+                                &rendered.rgba,
+                            );
+                            let tex = ctx.load_texture(
+                                format!("pdf_thumb_{page_idx}"),
+                                color_img,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.thumb_cache.insert(page_idx, tex);
+                            rendered_this_frame += 1;
+                            ctx.request_repaint();
+                        }
+                    }
+
+                    let is_current = page_idx == self.current_page;
+                    let (pw, ph) = self
+                        .doc
+                        .as_ref()
+                        .map_or((612.0, 792.0), |d| d.page_size_pt(page_idx));
+                    let aspect = (ph / pw.max(1.0)).clamp(0.4, 2.0);
+                    let img_h = (thumb_w * aspect).min(row_h - 28.0);
+                    let img_w = img_h / aspect;
+
+                    ui.vertical_centered(|ui| {
+                        let frame = egui::Frame::NONE
+                            .stroke(if is_current {
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 160, 255))
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(70))
+                            })
+                            .inner_margin(2.0);
+
+                        let resp = frame
+                            .show(ui, |ui| {
+                                let (img_rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(img_w, img_h),
+                                    egui::Sense::click(),
+                                );
+                                if let Some(tex) = self.thumb_cache.get(&page_idx) {
+                                    ui.painter().image(
+                                        tex.id(),
+                                        img_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else {
+                                    ui.painter().rect_filled(
+                                        img_rect,
+                                        2.0,
+                                        egui::Color32::from_gray(50),
+                                    );
+                                }
+                                resp
+                            })
+                            .inner;
+
+                        if resp.clicked() {
+                            jump_to = Some(page_idx);
+                        }
+
+                        let label_resp = ui.selectable_label(is_current, format!("{}", page_idx + 1));
+                        if label_resp.clicked() {
+                            jump_to = Some(page_idx);
+                        }
+                    });
+                }
+            });
+
+        if let Some(page) = jump_to {
+            self.goto_page(page);
+        }
+    }
+
+    /// Draw overlay vertical and horizontal scrollbars on the canvas edges.
+    /// Returns `true` if a scrollbar is currently hovered or being dragged.
+    fn draw_scrollbars(&mut self, ui: &mut egui::Ui, rect: egui::Rect) -> bool {
+        if !self.config.show_scrollbars || self.doc.is_none() {
+            return false;
+        }
+
+        let (max_x, min_y, max_y, total_w, total_h) = self.scroll_bounds(rect.size());
+        let show_v = (max_y - min_y) > 1.0;
+        let show_h = max_x > 1.0;
+        let bar_thickness = 12.0_f32;
+        let pad = 2.0_f32;
+        let mut active = false;
+
+        // Vertical scrollbar (right edge)
+        if show_v {
+            let track_bottom = if show_h {
+                rect.max.y - bar_thickness - pad
+            } else {
+                rect.max.y - pad
+            };
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.max.x - bar_thickness - pad, rect.min.y + pad),
+                egui::pos2(rect.max.x - pad, track_bottom),
+            );
+
+            if track_rect.height() > 32.0 {
+                let id = ui.make_persistent_id("pdf_v_scrollbar");
+                let resp = ui.interact(track_rect, id, egui::Sense::click_and_drag());
+                let is_hot = resp.hovered() || resp.dragged();
+                if is_hot {
+                    active = true;
+                }
+
+                let visible_frac = (rect.height() / total_h.max(1.0)).clamp(0.05, 1.0);
+                let thumb_h = (track_rect.height() * visible_frac).max(28.0);
+                let travel = (track_rect.height() - thumb_h).max(1.0);
+
+                if (resp.dragged() || resp.clicked())
+                    && let Some(pos) = resp.interact_pointer_pos()
+                {
+                    let t = ((pos.y - track_rect.min.y - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
+                    self.scroll_y = min_y + t * (max_y - min_y);
+                    self.clamp_scroll(rect.size());
+                }
+
+                let t = ((self.scroll_y - min_y) / (max_y - min_y).max(1.0)).clamp(0.0, 1.0);
+                let thumb_y = track_rect.min.y + t * travel;
+                let thumb_rect = egui::Rect::from_min_size(
+                    egui::pos2(track_rect.min.x + 1.0, thumb_y),
+                    egui::vec2(track_rect.width() - 2.0, thumb_h),
+                );
+
+                let painter = ui.painter_at(rect);
+                let track_bg = if is_hot {
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 24, 120)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 24, 55)
+                };
+                let thumb_bg = if resp.dragged() {
+                    egui::Color32::from_rgba_unmultiplied(220, 220, 230, 230)
+                } else if resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(195, 195, 205, 200)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(160, 160, 170, 135)
+                };
+
+                painter.rect_filled(track_rect, 4.0, track_bg);
+                painter.rect_filled(thumb_rect, 4.0, thumb_bg);
+
+                // Floating page indicator badge while dragging the vertical scrollbar
+                if resp.dragged() {
+                    let badge_text = format!("Page {} / {}", self.current_page + 1, self.page_count());
+                    let badge_pos = egui::pos2(track_rect.min.x - 10.0, thumb_rect.center().y);
+                    let galley = painter.layout_no_wrap(
+                        badge_text,
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::WHITE,
+                    );
+                    let badge_size = galley.size() + egui::vec2(14.0, 8.0);
+                    let badge_rect = egui::Rect::from_min_size(
+                        egui::pos2(badge_pos.x - badge_size.x, badge_pos.y - badge_size.y * 0.5),
+                        badge_size,
+                    );
+                    painter.rect_filled(
+                        badge_rect,
+                        4.0,
+                        egui::Color32::from_rgba_unmultiplied(24, 24, 30, 225),
+                    );
+                    painter.galley(badge_rect.min + egui::vec2(7.0, 4.0), galley, egui::Color32::WHITE);
+                }
+            }
+        }
+
+        // Horizontal scrollbar (bottom edge)
+        if show_h {
+            let track_right = if show_v {
+                rect.max.x - bar_thickness - pad * 2.0
+            } else {
+                rect.max.x - pad
+            };
+            let track_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x + pad, rect.max.y - bar_thickness - pad),
+                egui::pos2(track_right, rect.max.y - pad),
+            );
+
+            if track_rect.width() > 32.0 {
+                let id = ui.make_persistent_id("pdf_h_scrollbar");
+                let resp = ui.interact(track_rect, id, egui::Sense::click_and_drag());
+                let is_hot = resp.hovered() || resp.dragged();
+                if is_hot {
+                    active = true;
+                }
+
+                let visible_frac = (rect.width() / total_w.max(1.0)).clamp(0.05, 1.0);
+                let thumb_w = (track_rect.width() * visible_frac).max(28.0);
+                let travel = (track_rect.width() - thumb_w).max(1.0);
+
+                // Note: positive scroll_x shifts page right (revealing left side), so map t=0 -> +max_x, t=1 -> -max_x
+                if (resp.dragged() || resp.clicked())
+                    && let Some(pos) = resp.interact_pointer_pos()
+                {
+                    let t = ((pos.x - track_rect.min.x - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
+                    self.scroll_x = max_x - t * (2.0 * max_x);
+                    self.clamp_scroll(rect.size());
+                }
+
+                let t = ((max_x - self.scroll_x) / (2.0 * max_x).max(1.0)).clamp(0.0, 1.0);
+                let thumb_x = track_rect.min.x + t * travel;
+                let thumb_rect = egui::Rect::from_min_size(
+                    egui::pos2(thumb_x, track_rect.min.y + 1.0),
+                    egui::vec2(thumb_w, track_rect.height() - 2.0),
+                );
+
+                let painter = ui.painter_at(rect);
+                let track_bg = if is_hot {
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 24, 120)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 24, 55)
+                };
+                let thumb_bg = if resp.dragged() {
+                    egui::Color32::from_rgba_unmultiplied(220, 220, 230, 230)
+                } else if resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(195, 195, 205, 200)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(160, 160, 170, 135)
+                };
+
+                painter.rect_filled(track_rect, 4.0, track_bg);
+                painter.rect_filled(thumb_rect, 4.0, thumb_bg);
+            }
+        }
+
+        active
     }
 
     fn draw_search_bar(&mut self, ui: &mut egui::Ui) {
@@ -1219,8 +1618,6 @@ impl PdfReaderApp {
         self.last_canvas_size = rect.size();
         ui.painter().rect_filled(rect, 0.0, canvas_color);
 
-        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
-
         if let Some(err) = &self.status_error {
             ui.painter().text(
                 rect.center(),
@@ -1276,24 +1673,34 @@ impl PdfReaderApp {
         }
         self.clamp_scroll(rect.size());
 
+        // Check if pointer is currently over a scrollbar zone so canvas clicks/drags don't steal it
+        let hover_pos = ui.ctx().input(|i| i.pointer.hover_pos());
+        let on_scrollbar = self.config.show_scrollbars
+            && hover_pos.is_some_and(|p| p.x >= rect.max.x - 16.0 || p.y >= rect.max.y - 16.0);
+
+        let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+
         let visible_pages = self.compute_visible_pages(rect);
         for &(page_idx, _) in &visible_pages {
             self.ensure_links_loaded(page_idx);
         }
 
         // Hit-test pointer against links and text on visible pages
-        let hover_pos = ui.ctx().input(|i| i.pointer.hover_pos());
-        let hovered_page_pt: Option<(usize, f32, f32, egui::Rect)> = hover_pos.and_then(|pos| {
-            visible_pages.iter().find_map(|&(page_idx, page_rect)| {
-                if page_rect.contains(pos) {
-                    let x_pt = (pos.x - page_rect.min.x) / self.zoom;
-                    let y_pt = (pos.y - page_rect.min.y) / self.zoom;
-                    Some((page_idx, x_pt, y_pt, page_rect))
-                } else {
-                    None
-                }
+        let hovered_page_pt: Option<(usize, f32, f32, egui::Rect)> = if on_scrollbar {
+            None
+        } else {
+            hover_pos.and_then(|pos| {
+                visible_pages.iter().find_map(|&(page_idx, page_rect)| {
+                    if page_rect.contains(pos) {
+                        let x_pt = (pos.x - page_rect.min.x) / self.zoom;
+                        let y_pt = (pos.y - page_rect.min.y) / self.zoom;
+                        Some((page_idx, x_pt, y_pt, page_rect))
+                    } else {
+                        None
+                    }
+                })
             })
-        });
+        };
 
         let hovered_link: Option<(usize, PageLink, egui::Rect)> =
             hovered_page_pt.and_then(|(page_idx, x_pt, y_pt, page_rect)| {
@@ -1326,7 +1733,7 @@ impl PdfReaderApp {
         }
 
         // Click handling: open link or clear selection
-        if response.clicked() {
+        if response.clicked() && !on_scrollbar {
             if let Some((_, link, _)) = &hovered_link {
                 match &link.target {
                     LinkTarget::InternalPage(p) => self.jump_via_link(*p),
@@ -1341,7 +1748,7 @@ impl PdfReaderApp {
 
         // Drag start: dispatch based on configured per-button DragAction (Space + Left always pans)
         let space_held = ui.ctx().input(|i| i.key_down(egui::Key::Space));
-        if response.drag_started() {
+        if response.drag_started() && !on_scrollbar {
             let drag_action = if response.drag_started_by(egui::PointerButton::Primary) {
                 if space_held {
                     DragAction::Pan
@@ -1676,6 +2083,9 @@ impl PdfReaderApp {
             }
         }
 
+        // Draw overlay vertical & horizontal scrollbars on top of the canvas
+        let _ = self.draw_scrollbars(ui, rect);
+
         // Pre-render at most 1 adjacent page when idle
         if !is_zooming
             && let (Some(doc), Some(&(first_vis, _)), Some(&(last_vis, _))) =
@@ -1803,6 +2213,13 @@ impl eframe::App for PdfReaderApp {
                 .show(ui, |ui| {
                     self.draw_toc_panel(ui);
                 });
+        } else if self.show_thumbnails {
+            egui::Panel::left("thumb_panel")
+                .resizable(true)
+                .default_size(175.0)
+                .show(ui, |ui| {
+                    self.draw_thumbnails_panel(ui);
+                });
         }
 
         egui::CentralPanel::default()
@@ -1811,6 +2228,7 @@ impl eframe::App for PdfReaderApp {
                 self.draw_canvas(ui);
             });
 
+        self.draw_goto_window(&ctx);
         self.draw_settings_window(&ctx);
     }
 }
