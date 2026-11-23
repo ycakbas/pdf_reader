@@ -256,6 +256,8 @@ pub struct PdfReaderApp {
     links_cache: HashMap<usize, Vec<PageLink>>,
     drag_mode: DragMode,
     drag_button: Option<egui::PointerButton>,
+    pan_start_pointer: Option<egui::Pos2>,
+    pan_start_scroll: egui::Vec2,
     selection: Option<TextSelection>,
 
     cache: PageCache,
@@ -328,6 +330,8 @@ impl PdfReaderApp {
             links_cache: HashMap::new(),
             drag_mode: DragMode::None,
             drag_button: None,
+            pan_start_pointer: None,
+            pan_start_scroll: egui::Vec2::ZERO,
             selection: None,
             cache: PageCache::new(),
         };
@@ -363,6 +367,7 @@ impl PdfReaderApp {
                 self.selection = None;
                 self.drag_mode = DragMode::None;
                 self.drag_button = None;
+                self.pan_start_pointer = None;
                 self.search_matches.clear();
                 self.search_last_executed.clear();
                 self.search_active_idx = 0;
@@ -1812,6 +1817,11 @@ impl PdfReaderApp {
                 DragAction::Pan => {
                     self.drag_mode = DragMode::Pan;
                     self.drag_button = started_btn;
+                    self.pan_start_pointer = ui
+                        .ctx()
+                        .input(|i| i.pointer.press_origin())
+                        .or(latest_pos);
+                    self.pan_start_scroll = egui::vec2(self.scroll_x, self.scroll_y);
                 }
                 DragAction::SelectText => {
                     // Use press origin if available so selection starts right where the user pressed
@@ -1868,20 +1878,32 @@ impl PdfReaderApp {
         {
             self.drag_mode = DragMode::None;
             self.drag_button = None;
+            self.pan_start_pointer = None;
         }
 
-        // Active drag update (uses pointer.delta() / latest_pos() so outside-window movement keeps working)
+        // Active drag update (anchor-based pan prevents any slip when cursor leaves/re-enters window)
         match self.drag_mode {
             DragMode::Pan => {
-                let delta = ui.ctx().input(|i| i.pointer.delta());
-                if delta != egui::Vec2::ZERO {
-                    self.scroll_x += delta.x;
-                    if self.continuous_scroll {
-                        self.scroll_y -= delta.y;
+                if let (Some(start_pos), Some(pos)) = (self.pan_start_pointer, latest_pos) {
+                    let total = pos - start_pos;
+                    let desired_x = self.pan_start_scroll.x + total.x;
+                    let desired_y = if self.continuous_scroll {
+                        self.pan_start_scroll.y - total.y
                     } else {
-                        self.scroll_y += delta.y;
-                    }
+                        self.pan_start_scroll.y + total.y
+                    };
+
+                    self.scroll_x = desired_x;
+                    self.scroll_y = desired_y;
                     self.clamp_scroll(rect.size());
+
+                    // Keep anchor synced if we hit a scroll boundary so reversing has zero dead-zone
+                    if (self.scroll_x - desired_x).abs() > 0.5
+                        || (self.scroll_y - desired_y).abs() > 0.5
+                    {
+                        self.pan_start_pointer = Some(pos);
+                        self.pan_start_scroll = egui::vec2(self.scroll_x, self.scroll_y);
+                    }
                 }
             }
             DragMode::SelectText => {
@@ -1936,7 +1958,7 @@ impl PdfReaderApp {
         }
 
         // Mouse wheel + trackpad pinch zoom (anchored at mouse cursor!)
-        if response.hovered() {
+        if ui.rect_contains_pointer(rect) {
             let (scroll_delta, pinch_delta, modifiers, pointer_pos) = ui.ctx().input(|i| {
                 (
                     i.smooth_scroll_delta,
@@ -1972,13 +1994,23 @@ impl PdfReaderApp {
 
                 match wheel_action {
                     WheelAction::Scroll => {
-                        self.scroll_x += delta.x;
-                        if self.continuous_scroll {
-                            self.scroll_y -= delta.y;
+                        let (_, min_y, max_y, _, _) = self.scroll_bounds(rect.size());
+                        if !self.continuous_scroll && (max_y - min_y) <= 1.0 {
+                            // In single-page mode when page fits vertically, wheel flips pages
+                            if delta.y < -4.0 {
+                                self.goto_page(self.current_page.saturating_add(1));
+                            } else if delta.y > 4.0 {
+                                self.goto_page(self.current_page.saturating_sub(1));
+                            }
                         } else {
-                            self.scroll_y += delta.y;
+                            self.scroll_x += delta.x;
+                            if self.continuous_scroll {
+                                self.scroll_y -= delta.y;
+                            } else {
+                                self.scroll_y += delta.y;
+                            }
+                            self.clamp_scroll(rect.size());
                         }
-                        self.clamp_scroll(rect.size());
                     }
                     WheelAction::HorizontalScroll => {
                         self.scroll_x += delta.y + delta.x;
