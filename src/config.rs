@@ -118,6 +118,7 @@ pub enum DoubleClickAction {
 #[serde(default)]
 pub struct MouseConfig {
     pub pan_button: MouseButtonSpec,
+    pub select_button: MouseButtonSpec,
     pub wheel_action: WheelAction,
     pub ctrl_wheel_action: WheelAction,
     pub shift_wheel_action: WheelAction,
@@ -131,6 +132,7 @@ impl Default for MouseConfig {
     fn default() -> Self {
         Self {
             pan_button: MouseButtonSpec::Left,
+            select_button: MouseButtonSpec::Left,
             wheel_action: WheelAction::Scroll,
             ctrl_wheel_action: WheelAction::Zoom,
             shift_wheel_action: WheelAction::HorizontalScroll,

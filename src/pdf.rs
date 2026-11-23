@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use pdfium_render::prelude::*;
 
+pub const MAX_RENDER_WIDTH_PX: i32 = 3072;
+
 static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
 
 pub struct RenderedPage {
@@ -20,7 +22,7 @@ pub struct BookmarkNode {
     pub children: Vec<BookmarkNode>,
 }
 
-/// Match bounding box in page-local PDF points, normalized to top-left origin
+/// Bounding box in page-local PDF points, normalized to top-left origin
 /// (`x` rightwards, `y` downwards).
 #[derive(Debug, Clone, Copy)]
 pub struct MatchRectPt {
@@ -30,10 +32,28 @@ pub struct MatchRectPt {
     pub bottom: f32,
 }
 
+impl MatchRectPt {
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchMatch {
     pub page_index: usize,
     pub rects: Vec<MatchRectPt>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LinkTarget {
+    InternalPage(usize),
+    ExternalUri(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct PageLink {
+    pub rect: MatchRectPt,
+    pub target: LinkTarget,
 }
 
 /// Locate and bind to `libpdfium` once per process using a cross-platform search order:
@@ -134,10 +154,10 @@ impl OpenDocument {
             .get(page_index as i32)
             .with_context(|| format!("Invalid page index {page_index}"))?;
 
-        let clamped_width = target_width_px.clamp(64, 8192);
+        let clamped_width = target_width_px.clamp(64, MAX_RENDER_WIDTH_PX);
         let render_config = PdfRenderConfig::new()
             .set_target_width(clamped_width)
-            .set_maximum_height(8192);
+            .set_maximum_height(4096);
 
         let bitmap = page
             .render_with_config(&render_config)
@@ -195,6 +215,116 @@ impl OpenDocument {
         }
 
         results
+    }
+
+    /// Extract all clickable links (internal destinations and external URIs) on a page.
+    pub fn page_links(&self, page_index: usize) -> Vec<PageLink> {
+        let Ok(page) = self.doc.pages().get(page_index as i32) else {
+            return Vec::new();
+        };
+        let page_height = self.page_size_pt(page_index).1;
+        let mut out = Vec::new();
+
+        for link in page.links().iter() {
+            let Ok(r) = link.rect() else {
+                continue;
+            };
+            let rect = MatchRectPt {
+                left: r.left().value,
+                top: (page_height - r.top().value).max(0.0),
+                right: r.right().value,
+                bottom: (page_height - r.bottom().value).max(0.0),
+            };
+
+            let target = link
+                .destination()
+                .and_then(|d| d.page_index().ok())
+                .and_then(|idx| usize::try_from(idx).ok())
+                .map(LinkTarget::InternalPage)
+                .or_else(|| {
+                    link.action().and_then(|action| {
+                        if let Some(uri) = action.as_uri_action().and_then(|u| u.uri().ok()) {
+                            return Some(LinkTarget::ExternalUri(uri));
+                        }
+                        action
+                            .as_local_destination_action()
+                            .and_then(|l| l.destination().ok())
+                            .and_then(|d| d.page_index().ok())
+                            .and_then(|idx| usize::try_from(idx).ok())
+                            .map(LinkTarget::InternalPage)
+                    })
+                });
+
+            if let Some(target) = target {
+                out.push(PageLink { rect, target });
+            }
+        }
+
+        out
+    }
+
+    /// Find the character index near a page-local point (top-left origin, in PDF points).
+    pub fn char_index_at(
+        &self,
+        page_index: usize,
+        x_pt: f32,
+        y_pt_top: f32,
+        tolerance_pt: f32,
+    ) -> Option<usize> {
+        let page = self.doc.pages().get(page_index as i32).ok()?;
+        let page_height = self.page_size_pt(page_index).1;
+        let y_pt_pdf = page_height - y_pt_top;
+        let text = page.text().ok()?;
+        let chars = text.chars();
+        let ch = chars.get_char_near_point(
+            PdfPoints::new(x_pt),
+            PdfPoints::new(y_pt_pdf),
+            PdfPoints::new(tolerance_pt),
+            PdfPoints::new(tolerance_pt),
+        )?;
+        Some(ch.index())
+    }
+
+    /// Compute selection highlight rectangles (top-left origin, PDF points) and extracted text
+    /// for an inclusive character range `[a, b]` on `page_index`.
+    pub fn selection_rects_and_text(
+        &self,
+        page_index: usize,
+        a: usize,
+        b: usize,
+    ) -> (Vec<MatchRectPt>, String) {
+        let Ok(page) = self.doc.pages().get(page_index as i32) else {
+            return (Vec::new(), String::new());
+        };
+        let Ok(text) = page.text() else {
+            return (Vec::new(), String::new());
+        };
+        let page_height = self.page_size_pt(page_index).1;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let count = hi - lo + 1;
+
+        let mut rects = Vec::new();
+        for seg in text.segments_subset(lo, count).iter() {
+            let b = seg.bounds();
+            rects.push(MatchRectPt {
+                left: b.left().value,
+                top: (page_height - b.top().value).max(0.0),
+                right: b.right().value,
+                bottom: (page_height - b.bottom().value).max(0.0),
+            });
+        }
+
+        let chars = text.chars();
+        let mut selected = String::with_capacity(count);
+        for idx in lo..=hi {
+            if let Ok(ch) = chars.get(idx)
+                && let Some(c) = ch.unicode_char()
+            {
+                selected.push(c);
+            }
+        }
+
+        (rects, selected)
     }
 }
 
