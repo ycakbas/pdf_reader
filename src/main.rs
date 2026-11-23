@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod pdf;
+mod render_worker;
 mod shader;
 mod theme;
 

@@ -11,8 +11,9 @@ use crate::config::{
 };
 use crate::pdf::{
     BookmarkNode, HARD_MAX_RENDER_WIDTH_PX, LinkTarget, MIN_RENDER_WIDTH_PX, MatchRectPt,
-    OpenDocument, PageImage, PageLink, SearchMatch, init_pdfium,
+    OpenDocument, PageImage, PageLink, RenderedPage, SearchMatch, init_pdfium,
 };
+use crate::render_worker::{RenderJob, RenderWorker};
 use crate::shader::{PdfShaderResources, paint_page_callback};
 use crate::theme::{ResolvedTheme, all_themes};
 
@@ -135,21 +136,16 @@ impl PageCache {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_into_cache(
+    fn insert_rendered(
         &mut self,
         next_gpu_key: &mut u64,
-        doc: &OpenDocument,
         page_index: usize,
-        clamped_target_width_px: i32,
-        max_width_px: i32,
-        lcd_text: bool,
+        rendered_width_px: i32,
+        mut rendered: RenderedPage,
         theme: &ResolvedTheme,
         ctx: &egui::Context,
         wgpu_state: Option<&egui_wgpu::RenderState>,
-    ) -> anyhow::Result<()> {
-        let mut rendered =
-            doc.render_page(page_index, clamped_target_width_px, max_width_px, lcd_text)?;
-
+    ) {
         if let Some(old) = self.entries.remove(&page_index)
             && let (Some(rs), Some(old_key)) = (wgpu_state, old.gpu_key)
         {
@@ -167,7 +163,7 @@ impl PageCache {
                 &rendered.rgba,
             );
             CachedPageEntry {
-                rendered_width_px: clamped_target_width_px,
+                rendered_width_px,
                 last_used_frame: self.frame_counter,
                 gpu_key: Some(gpu_key),
                 cpu_texture: None,
@@ -184,7 +180,7 @@ impl PageCache {
                 egui::TextureOptions::LINEAR,
             );
             CachedPageEntry {
-                rendered_width_px: clamped_target_width_px,
+                rendered_width_px,
                 last_used_frame: self.frame_counter,
                 gpu_key: None,
                 cpu_texture: Some((theme.name.clone(), tex)),
@@ -193,7 +189,6 @@ impl PageCache {
 
         self.entries.insert(page_index, entry);
         self.evict_lru(wgpu_state);
-        Ok(())
     }
 
     fn evict_lru(&mut self, wgpu_state: Option<&egui_wgpu::RenderState>) {
@@ -216,6 +211,7 @@ impl PageCache {
 }
 
 struct TabState {
+    id: u64,
     doc: OpenDocument,
     title: String,
     current_page: usize,
@@ -243,7 +239,12 @@ struct TabState {
 }
 
 impl TabState {
-    fn new(doc: OpenDocument, default_fit_mode: FitMode, initial_page: Option<usize>) -> Self {
+    fn new(
+        id: u64,
+        doc: OpenDocument,
+        default_fit_mode: FitMode,
+        initial_page: Option<usize>,
+    ) -> Self {
         let title = doc
             .path
             .file_name()
@@ -254,6 +255,7 @@ impl TabState {
             .unwrap_or(0)
             .min(doc.page_count.saturating_sub(1));
         Self {
+            id,
             doc,
             title,
             current_page: target_page,
@@ -470,6 +472,8 @@ pub struct PdfReaderApp {
     active_theme_idx: usize,
     wgpu_state: Option<egui_wgpu::RenderState>,
     next_gpu_key: u64,
+    next_tab_id: u64,
+    worker: RenderWorker,
 
     tabs: Vec<TabState>,
     active_tab: usize,
@@ -507,11 +511,14 @@ pub struct PdfReaderApp {
     search_focus_requested: bool,
     search_match_case: bool,
 
-    // Active drag & context menu state
+    // Active drag, throttled hover cursor & context menu state
     drag_mode: DragMode,
     drag_button: Option<egui::PointerButton>,
     pan_start_pointer: Option<egui::Pos2>,
     pan_start_scroll: egui::Vec2,
+    hover_text_cache_key: Option<(u64, usize, i32, i32)>,
+    hover_is_over_text: bool,
+    last_hover_text_check: Option<Instant>,
     context_menu: Option<ContextMenuState>,
     toast: Option<(String, Instant)>,
 }
@@ -539,6 +546,8 @@ impl PdfReaderApp {
         let continuous_scroll = config.continuous_scroll;
         let status_error = init_pdfium().err().map(|e| e.to_string());
 
+        let worker = RenderWorker::spawn(cc.egui_ctx.clone());
+
         let mut app = Self {
             config,
             config_path,
@@ -547,6 +556,8 @@ impl PdfReaderApp {
             active_theme_idx,
             wgpu_state,
             next_gpu_key: 1,
+            next_tab_id: 1,
+            worker,
             tabs: Vec::new(),
             active_tab: 0,
             status_error,
@@ -576,6 +587,9 @@ impl PdfReaderApp {
             drag_button: None,
             pan_start_pointer: None,
             pan_start_scroll: egui::Vec2::ZERO,
+            hover_text_cache_key: None,
+            hover_is_over_text: false,
+            last_hover_text_check: None,
             context_menu: None,
             toast: None,
         };
@@ -611,6 +625,42 @@ impl PdfReaderApp {
         let rs = self.wgpu_state.as_ref();
         for tab in &mut self.tabs {
             tab.cache.clear(rs);
+            self.worker.clear_in_flight_for_tab(tab.id);
+        }
+    }
+
+    fn drain_worker_results(&mut self, ctx: &egui::Context) {
+        let results = self.worker.poll_results();
+        if results.is_empty() {
+            return;
+        }
+        let theme = self.active_theme().clone();
+        for res in results {
+            let Some(tab) = self.tabs.iter_mut().find(|t| t.id == res.tab_id) else {
+                continue;
+            };
+            if res.is_thumbnail {
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [res.rendered.width, res.rendered.height],
+                    &res.rendered.rgba,
+                );
+                let tex = ctx.load_texture(
+                    format!("pdf_thumb_{}_{}", tab.id, res.page_index),
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                );
+                tab.thumb_cache.insert(res.page_index, tex);
+            } else {
+                tab.cache.insert_rendered(
+                    &mut self.next_gpu_key,
+                    res.page_index,
+                    res.target_width_px,
+                    res.rendered,
+                    &theme,
+                    ctx,
+                    self.wgpu_state.as_ref(),
+                );
+            }
         }
     }
 
@@ -638,7 +688,9 @@ impl PdfReaderApp {
         match OpenDocument::open(&path) {
             Ok(doc) => {
                 let default_fit = FitMode::from(self.config.default_fit_mode);
-                let mut tab = TabState::new(doc, default_fit, initial_page);
+                let tab_id = self.next_tab_id;
+                self.next_tab_id = self.next_tab_id.wrapping_add(1);
+                let mut tab = TabState::new(tab_id, doc, default_fit, initial_page);
                 let target_page = tab.current_page;
                 tab.goto_page(
                     target_page,
@@ -677,6 +729,11 @@ impl PdfReaderApp {
         }
         let mut removed = self.tabs.remove(index);
         removed.cache.clear(self.wgpu_state.as_ref());
+        self.worker.clear_in_flight_for_tab(removed.id);
+        let path_still_used = self.tabs.iter().any(|t| t.doc.path == removed.doc.path);
+        if !path_still_used {
+            self.worker.close_path(removed.doc.path);
+        }
 
         if self.tabs.is_empty() {
             self.active_tab = 0;
@@ -2038,11 +2095,12 @@ impl PdfReaderApp {
         let thumb_w = 136.0_f32;
         let row_h = 196.0_f32;
         let mut jump_to: Option<usize> = None;
-        let mut rendered_this_frame = 0_usize;
-        let ctx = ui.ctx().clone();
+        let tab_id = tab.id;
+        let tab_path = tab.doc.path.clone();
+        let mut thumb_jobs: Vec<usize> = Vec::new();
 
         let mut scroll_area = egui::ScrollArea::vertical()
-            .id_salt(("thumb_scroll", self.active_tab))
+            .id_salt(("thumb_scroll", tab_id))
             .auto_shrink([false, false]);
 
         if tab.last_thumb_synced_page != Some(tab.current_page) {
@@ -2055,21 +2113,8 @@ impl PdfReaderApp {
 
         scroll_area.show_rows(ui, row_h, count, |ui, row_range| {
             for page_idx in row_range {
-                if !tab.thumb_cache.contains_key(&page_idx) && rendered_this_frame < 2 {
-                    if let Ok(rendered) = tab.doc.render_page(page_idx, 160, 512, false) {
-                        let color_img = egui::ColorImage::from_rgba_unmultiplied(
-                            [rendered.width, rendered.height],
-                            &rendered.rgba,
-                        );
-                        let tex = ctx.load_texture(
-                            format!("pdf_thumb_{}_{page_idx}", self.active_tab),
-                            color_img,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        tab.thumb_cache.insert(page_idx, tex);
-                        rendered_this_frame += 1;
-                        ctx.request_repaint();
-                    }
+                if !tab.thumb_cache.contains_key(&page_idx) {
+                    thumb_jobs.push(page_idx);
                 }
 
                 let is_current = page_idx == tab.current_page;
@@ -2127,6 +2172,19 @@ impl PdfReaderApp {
                 });
             }
         });
+
+        for page_idx in thumb_jobs {
+            self.worker.request(RenderJob {
+                tab_id,
+                path: tab_path.clone(),
+                page_index: page_idx,
+                target_width_px: 160,
+                max_width_px: 512,
+                lcd_text: false,
+                is_thumbnail: true,
+                high_priority: false,
+            });
+        }
 
         if let Some(page) = jump_to {
             self.goto_page(page);
@@ -2500,10 +2558,6 @@ impl PdfReaderApp {
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
         let visible_pages = self.tabs[self.active_tab].compute_visible_pages(rect, cont, gap);
-        for &(page_idx, _) in &visible_pages {
-            self.tabs[self.active_tab].ensure_links_loaded(page_idx);
-            self.tabs[self.active_tab].ensure_images_loaded(page_idx);
-        }
 
         let zoom_now = self.tabs[self.active_tab].zoom;
         let hovered_page_pt: Option<(usize, f32, f32, egui::Rect)> = if on_scrollbar {
@@ -2521,6 +2575,14 @@ impl PdfReaderApp {
                 })
             })
         };
+
+        // Lazily load links & images ONLY for the page currently under the pointer (not every scrolled-past page)
+        if let Some((page_idx, _, _, _)) = hovered_page_pt
+            && self.drag_mode == DragMode::None
+        {
+            self.tabs[self.active_tab].ensure_links_loaded(page_idx);
+            self.tabs[self.active_tab].ensure_images_loaded(page_idx);
+        }
 
         let hovered_link: Option<(usize, PageLink, egui::Rect)> =
             hovered_page_pt.and_then(|(page_idx, x_pt, y_pt, page_rect)| {
@@ -2553,12 +2615,30 @@ impl PdfReaderApp {
                     .map(|img| (page_idx, img.clone(), page_rect))
             });
 
-        let hovered_char: Option<(usize, usize)> = hovered_page_pt.and_then(|(page_idx, x_pt, y_pt, _)| {
-            self.tabs[self.active_tab]
-                .doc
-                .char_index_at(page_idx, x_pt, y_pt, 6.0, 6.0)
-                .map(|c| (page_idx, c))
-        });
+        // Throttle char_index_at hover cursor check (saves ~1.5ms/frame of PDFium FFI while scrolling/idling)
+        let hovered_over_text = if self.drag_mode != DragMode::None || hovered_link.is_some() {
+            false
+        } else if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt {
+            let tab_id = self.tabs[self.active_tab].id;
+            let qkey = (tab_id, page_idx, (x_pt * 0.25) as i32, (y_pt * 0.25) as i32);
+            let now = Instant::now();
+            let throttle_ok = self
+                .last_hover_text_check
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(40));
+            if self.hover_text_cache_key != Some(qkey) && throttle_ok {
+                self.hover_is_over_text = self.tabs[self.active_tab]
+                    .doc
+                    .char_index_at(page_idx, x_pt, y_pt, 6.0, 6.0)
+                    .is_some();
+                self.hover_text_cache_key = Some(qkey);
+                self.last_hover_text_check = Some(now);
+            }
+            self.hover_is_over_text
+        } else {
+            self.hover_text_cache_key = None;
+            self.hover_is_over_text = false;
+            false
+        };
 
         // Cursor icon & link tooltip
         if response.hovered() {
@@ -2571,7 +2651,7 @@ impl PdfReaderApp {
                 response.clone().on_hover_text(tip);
             } else if self.drag_mode == DragMode::Pan {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else if hovered_char.is_some() {
+            } else if hovered_over_text {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
             } else if hovered_image.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -2669,7 +2749,7 @@ impl PdfReaderApp {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(uri.clone()));
                     }
                 }
-            } else if hovered_char.is_none()
+            } else if !hovered_over_text
                 && let Some((img_page, ref img, _)) = hovered_image
             {
                 let tab = &mut self.tabs[self.active_tab];
@@ -3085,6 +3165,9 @@ impl PdfReaderApp {
         let use_gpu = self.wgpu_state.is_some();
         let theme = self.active_theme().clone();
 
+        let tab_id = self.tabs[self.active_tab].id;
+        let tab_path = self.tabs[self.active_tab].doc.path.clone();
+
         for &(page_idx, page_rect) in &visible_pages {
             let clamped_target_w = ((page_rect.width() * ppp * render_scale).round() as i32)
                 .clamp(MIN_RENDER_WIDTH_PX, max_render_w);
@@ -3098,19 +3181,16 @@ impl PdfReaderApp {
             };
 
             if should_render {
-                if let Err(err) = tab.cache.render_into_cache(
-                    &mut self.next_gpu_key,
-                    &tab.doc,
-                    page_idx,
-                    clamped_target_w,
-                    max_render_w,
+                self.worker.request(RenderJob {
+                    tab_id,
+                    path: tab_path.clone(),
+                    page_index: page_idx,
+                    target_width_px: clamped_target_w,
+                    max_width_px: max_render_w,
                     lcd_text,
-                    &theme,
-                    ui.ctx(),
-                    self.wgpu_state.as_ref(),
-                ) {
-                    self.status_error = Some(err.to_string());
-                }
+                    is_thumbnail: false,
+                    high_priority: true,
+                });
             } else {
                 tab.cache.touch(page_idx);
             }
@@ -3133,6 +3213,13 @@ impl PdfReaderApp {
                         egui::Color32::WHITE,
                     );
                 }
+            } else {
+                let bg = egui::Color32::from_rgb(
+                    theme.background[0],
+                    theme.background[1],
+                    theme.background[2],
+                );
+                painter.rect_filled(page_rect, 0.0, bg);
             }
 
             if let Some((hl_page, ref link, _)) = hovered_link
@@ -3230,12 +3317,12 @@ impl PdfReaderApp {
 
         let _ = self.draw_scrollbars(ui, rect);
 
-        // Pre-render at most 1 adjacent page when idle
+        // Async pre-render adjacent pages in the background worker when idle
         if !is_zooming
             && let (Some(&(first_vis, _)), Some(&(last_vis, _))) =
                 (visible_pages.first(), visible_pages.last())
         {
-            let tab = &mut self.tabs[self.active_tab];
+            let tab = &self.tabs[self.active_tab];
             let candidates = [
                 (last_vis + 1 < tab.doc.page_count).then_some(last_vis + 1),
                 first_vis.checked_sub(1),
@@ -3245,18 +3332,16 @@ impl PdfReaderApp {
                     as i32)
                     .clamp(MIN_RENDER_WIDTH_PX, max_render_w);
                 if tab.cache.needs_render(adj, adj_w, &theme.name, use_gpu) {
-                    let _ = tab.cache.render_into_cache(
-                        &mut self.next_gpu_key,
-                        &tab.doc,
-                        adj,
-                        adj_w,
-                        max_render_w,
+                    self.worker.request(RenderJob {
+                        tab_id,
+                        path: tab_path.clone(),
+                        page_index: adj,
+                        target_width_px: adj_w,
+                        max_width_px: max_render_w,
                         lcd_text,
-                        &theme,
-                        ui.ctx(),
-                        self.wgpu_state.as_ref(),
-                    );
-                    break;
+                        is_thumbnail: false,
+                        high_priority: false,
+                    });
                 }
             }
         }
@@ -3370,6 +3455,7 @@ fn draw_bookmark_node(
 impl eframe::App for PdfReaderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.drain_worker_results(&ctx);
         self.handle_dropped_files(&ctx);
         self.process_shortcuts(&ctx);
 

@@ -130,8 +130,8 @@ impl OpenDocument {
         let mut page_sizes_pt = Vec::with_capacity(page_count);
         for i in 0..page_count {
             let size = pages
-                .get(i as i32)
-                .map(|p| (p.width().value, p.height().value))
+                .page_size(i as i32)
+                .map(|r| (r.width().value, r.height().value))
                 .unwrap_or((612.0, 792.0));
             page_sizes_pt.push(size);
         }
@@ -587,6 +587,7 @@ fn build_bookmark_node(bm: &PdfBookmark<'_>) -> BookmarkNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn loads_pdfium_library() {
@@ -595,5 +596,104 @@ mod tests {
             .create_new_pdf()
             .expect("should create in-memory PDF via PDFium");
         assert_eq!(doc.pages().len(), 0);
+    }
+
+    /// Run with: `cargo test --release --offline stress_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stress_profile() {
+        let path = Path::new("test.pdf");
+        assert!(path.exists(), "test.pdf must exist in workspace root");
+
+        let t0 = Instant::now();
+        let _ = init_pdfium().expect("init pdfium");
+        let init_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = Instant::now();
+        let doc = OpenDocument::open(path).expect("open test.pdf");
+        let open_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "\n=== PDF Profile: {} ({} pages, {} root bookmarks) ===",
+            path.display(),
+            doc.page_count,
+            doc.bookmarks.len()
+        );
+        println!("init_pdfium:      {:7.2} ms", init_ms);
+        println!("OpenDocument:     {:7.2} ms", open_ms);
+
+        // 1. Render latency across target widths
+        let sample_pages: Vec<usize> = (0..doc.page_count.min(8)).collect();
+        for &w in &[1000, 1500, 2000, 3072, 4096] {
+            let mut times = Vec::new();
+            for &p in &sample_pages {
+                let ts = Instant::now();
+                let rendered = doc.render_page(p, w, 6144, true).expect("render");
+                times.push(ts.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(rendered.rgba.len());
+            }
+            times.sort_by(f64::total_cmp);
+            let avg = times.iter().sum::<f64>() / times.len() as f64;
+            let max = *times.last().unwrap_or(&0.0);
+            println!(
+                "render_page({w:4}px, lcd=true):  avg {:6.2} ms | max {:6.2} ms (n={})",
+                avg,
+                max,
+                times.len()
+            );
+        }
+
+        // 2. Per-frame hover cost: char_index_at() called 60 times (1 sec of 60fps hover!)
+        let (pw, ph) = doc.page_size_pt(0);
+        let t_hover = Instant::now();
+        let mut hits = 0usize;
+        for i in 0..60 {
+            let x = pw * (0.2 + 0.6 * (i as f32 / 60.0));
+            let y = ph * (0.2 + 0.6 * ((i * 7 % 60) as f32 / 60.0));
+            if doc.char_index_at(0, x, y, 6.0, 6.0).is_some() {
+                hits += 1;
+            }
+        }
+        let hover_total_ms = t_hover.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "char_index_at x60 (hover):      total {:6.2} ms | per-call {:6.3} ms (hits={hits})",
+            hover_total_ms,
+            hover_total_ms / 60.0
+        );
+
+        // 3. page_links & page_images extraction across first 10 pages
+        let mut link_ms = 0.0;
+        let mut img_ms = 0.0;
+        let mut total_links = 0;
+        let mut total_imgs = 0;
+        let check_pages = doc.page_count.min(10);
+        for p in 0..check_pages {
+            let tl = Instant::now();
+            total_links += doc.page_links(p).len();
+            link_ms += tl.elapsed().as_secs_f64() * 1000.0;
+
+            let ti = Instant::now();
+            total_imgs += doc.page_images(p).len();
+            img_ms += ti.elapsed().as_secs_f64() * 1000.0;
+        }
+        println!(
+            "page_links ({check_pages} pages):        total {:6.2} ms | avg {:6.2} ms (links={total_links})",
+            link_ms,
+            link_ms / check_pages.max(1) as f64
+        );
+        println!(
+            "page_images ({check_pages} pages):       total {:6.2} ms | avg {:6.2} ms (imgs={total_imgs})",
+            img_ms,
+            img_ms / check_pages.max(1) as f64
+        );
+
+        // 4. Full document text search
+        let ts = Instant::now();
+        let matches = doc.search("the", false);
+        let search_ms = ts.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "search(\"the\", all pages):       {:7.2} ms (matches={})",
+            search_ms,
+            matches.len()
+        );
     }
 }
