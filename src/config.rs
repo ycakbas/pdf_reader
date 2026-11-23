@@ -242,6 +242,9 @@ pub struct MouseConfig {
     pub shift_wheel_action: WheelAction,
     pub double_click_action: DoubleClickAction,
     pub scroll_speed: f32,
+    pub scroll_acceleration: bool,
+    pub scroll_accel_strength: f32,
+    pub scroll_accel_max: f32,
     pub zoom_step: f32,
     pub invert_scroll: bool,
 }
@@ -259,6 +262,9 @@ impl Default for MouseConfig {
             shift_wheel_action: WheelAction::HorizontalScroll,
             double_click_action: DoubleClickAction::FitWidth,
             scroll_speed: 1.0,
+            scroll_acceleration: false,
+            scroll_accel_strength: 1.5,
+            scroll_accel_max: 5.0,
             zoom_step: 1.15,
             invert_scroll: false,
         }

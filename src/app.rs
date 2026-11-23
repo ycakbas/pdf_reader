@@ -234,9 +234,12 @@ pub struct PdfReaderApp {
     thumb_cache: HashMap<usize, egui::TextureHandle>,
     last_thumb_synced_page: Option<usize>,
 
-    // Scrollbar drag state (survives pointer leaving window)
+    // Scrollbar drag & scroll acceleration state
     dragging_v_scrollbar: bool,
     dragging_h_scrollbar: bool,
+    scroll_accel_boost: f32,
+    last_scroll_time: Option<Instant>,
+    last_scroll_dir: f32,
 
     // Settings popup state
     settings_open: bool,
@@ -317,6 +320,9 @@ impl PdfReaderApp {
             last_thumb_synced_page: None,
             dragging_v_scrollbar: false,
             dragging_h_scrollbar: false,
+            scroll_accel_boost: 1.0,
+            last_scroll_time: None,
+            last_scroll_dir: 0.0,
             settings_open: false,
             settings_tab: SettingsTab::Mouse,
             settings_status: None,
@@ -1095,10 +1101,45 @@ impl PdfReaderApp {
                                 ui.add(
                                     egui::Slider::new(
                                         &mut self.config.mouse.scroll_speed,
-                                        0.2..=4.0,
+                                        0.2..=15.0,
                                     )
+                                    .logarithmic(true)
                                     .fixed_decimals(2),
                                 );
+                                ui.end_row();
+
+                                ui.label("Scroll Acceleration:");
+                                ui.checkbox(&mut self.config.mouse.scroll_acceleration, "");
+                                ui.end_row();
+
+                                ui.add_enabled_ui(self.config.mouse.scroll_acceleration, |ui| {
+                                    ui.label("Accel Strength:");
+                                });
+                                ui.add_enabled_ui(self.config.mouse.scroll_acceleration, |ui| {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.config.mouse.scroll_accel_strength,
+                                            0.2..=5.0,
+                                        )
+                                        .fixed_decimals(2),
+                                    );
+                                });
+                                ui.end_row();
+
+                                ui.add_enabled_ui(self.config.mouse.scroll_acceleration, |ui| {
+                                    ui.label("Max Accel Multiplier:");
+                                });
+                                ui.add_enabled_ui(self.config.mouse.scroll_acceleration, |ui| {
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.config.mouse.scroll_accel_max,
+                                            1.5..=20.0,
+                                        )
+                                        .logarithmic(true)
+                                        .fixed_decimals(1)
+                                        .suffix("x"),
+                                    );
+                                });
                                 ui.end_row();
 
                                 ui.label("Zoom Step:");
@@ -1982,7 +2023,6 @@ impl PdfReaderApp {
                 } else {
                     1.0
                 };
-                let delta = scroll_delta * sign * self.config.mouse.scroll_speed;
 
                 let wheel_action = if modifiers.command {
                     self.config.mouse.ctrl_wheel_action
@@ -1991,6 +2031,44 @@ impl PdfReaderApp {
                 } else {
                     self.config.mouse.wheel_action
                 };
+
+                let is_scroll_action = matches!(
+                    wheel_action,
+                    WheelAction::Scroll | WheelAction::HorizontalScroll
+                );
+
+                let accel_mult = if is_scroll_action && self.config.mouse.scroll_acceleration {
+                    let now = Instant::now();
+                    let dir = if scroll_delta.y.abs() >= scroll_delta.x.abs() {
+                        scroll_delta.y.signum()
+                    } else {
+                        scroll_delta.x.signum()
+                    };
+                    let dt = self
+                        .last_scroll_time
+                        .map(|t| now.duration_since(t).as_secs_f32())
+                        .unwrap_or(1.0);
+
+                    if dt > 0.35 || (dir != 0.0 && dir * self.last_scroll_dir < 0.0) {
+                        self.scroll_accel_boost = 1.0;
+                    } else {
+                        let decay = (-dt * 3.5).exp();
+                        let retained = 1.0 + (self.scroll_accel_boost - 1.0) * decay;
+                        let impulse = 0.22 * self.config.mouse.scroll_accel_strength;
+                        let max_mult = self.config.mouse.scroll_accel_max.max(1.0);
+                        self.scroll_accel_boost = (retained + impulse).clamp(1.0, max_mult);
+                    }
+                    self.last_scroll_time = Some(now);
+                    if dir != 0.0 {
+                        self.last_scroll_dir = dir;
+                    }
+                    self.scroll_accel_boost
+                } else {
+                    self.scroll_accel_boost = 1.0;
+                    1.0
+                };
+
+                let delta = scroll_delta * sign * self.config.mouse.scroll_speed * accel_mult;
 
                 match wheel_action {
                     WheelAction::Scroll => {
