@@ -16,6 +16,10 @@ pub struct Config {
     pub theme: String,
     /// Show the top status/toolbar on startup.
     pub show_toolbar: bool,
+    /// Enable continuous vertical scrolling across pages.
+    pub continuous_scroll: bool,
+    /// Gap in logical pixels between pages in continuous scroll mode.
+    pub page_gap: f32,
     /// Mouse behavior settings.
     pub mouse: MouseConfig,
     /// Keyboard shortcut bindings.
@@ -29,6 +33,8 @@ impl Default for Config {
         Self {
             theme: "light".to_string(),
             show_toolbar: true,
+            continuous_scroll: true,
+            page_gap: 12.0,
             mouse: MouseConfig::default(),
             shortcuts: ShortcutConfig::default(),
             themes: BTreeMap::new(),
@@ -150,6 +156,11 @@ pub struct ShortcutConfig {
     pub fit_page: Vec<String>,
     pub cycle_theme: Vec<String>,
     pub toggle_toolbar: Vec<String>,
+    pub toggle_toc: Vec<String>,
+    pub toggle_continuous: Vec<String>,
+    pub find: Vec<String>,
+    pub find_next: Vec<String>,
+    pub find_prev: Vec<String>,
     pub open_file: Vec<String>,
     pub quit: Vec<String>,
 }
@@ -168,6 +179,11 @@ impl Default for ShortcutConfig {
             fit_page: vec!["f".into()],
             cycle_theme: vec!["t".into()],
             toggle_toolbar: vec!["b".into()],
+            toggle_toc: vec!["Tab".into()],
+            toggle_continuous: vec!["c".into()],
+            find: vec!["Ctrl+F".into(), "Slash".into()],
+            find_next: vec!["n".into(), "F3".into()],
+            find_prev: vec!["Shift+N".into(), "Shift+F3".into()],
             open_file: vec!["Ctrl+O".into()],
             quit: vec!["Ctrl+Q".into(), "q".into()],
         }
@@ -187,6 +203,11 @@ pub enum Action {
     FitPage,
     CycleTheme,
     ToggleToolbar,
+    ToggleToc,
+    ToggleContinuous,
+    Find,
+    FindNext,
+    FindPrev,
     OpenFile,
     Quit,
 }
@@ -213,6 +234,11 @@ impl ShortcutConfig {
             (&self.fit_page, Action::FitPage),
             (&self.cycle_theme, Action::CycleTheme),
             (&self.toggle_toolbar, Action::ToggleToolbar),
+            (&self.toggle_toc, Action::ToggleToc),
+            (&self.toggle_continuous, Action::ToggleContinuous),
+            (&self.find, Action::Find),
+            (&self.find_next, Action::FindNext),
+            (&self.find_prev, Action::FindPrev),
             (&self.open_file, Action::OpenFile),
             (&self.quit, Action::Quit),
         ];
@@ -313,6 +339,12 @@ fn parse_key(name: &str) -> Option<egui::Key> {
         "plus" | "+" => Some(Key::Plus),
         "equals" | "=" => Some(Key::Equals),
         "minus" | "-" => Some(Key::Minus),
+        "slash" | "/" => Some(Key::Slash),
+        "f1" => Some(Key::F1),
+        "f2" => Some(Key::F2),
+        "f3" => Some(Key::F3),
+        "f4" => Some(Key::F4),
+        "f5" => Some(Key::F5),
         _ => None,
     }
 }

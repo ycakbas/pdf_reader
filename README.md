@@ -2,11 +2,14 @@
 
 An ultra-fast, cross-platform (macOS, Windows, Linux) PDF reader built in **Rust** with **PDFium** and **egui/eframe**.
 
-## Features (MVP)
-- **Fast startup & lazy rendering:** Opens directly to the first page using PDFium, rendering only visible pages at exact HiDPI resolution.
-- **PDF theming:** Built-in themes (`light`, `dark`, `sepia`, `gruvbox_dark`, `solarized_dark`, `oled`) plus custom `[themes.<name>]` definitions in config.
-- **Configurable mouse controls:** Customize pan button, wheel / Ctrl+wheel / Shift+wheel actions (`scroll`, `zoom`, `page`), scroll speed, and zoom step.
-- **Configurable keyboard shortcuts:** Remap navigation, zoom, fit modes, theming, and UI toggles in `config.toml`.
+## Features
+- **Fast startup & lazy rendering:** Opens directly using PDFium with an LRU GPU page cache and adjacent-page pre-rendering.
+- **Continuous vertical scrolling:** Smooth multi-page scrolling (toggle single-page mode with `c`).
+- **Zoom to cursor & pinch zoom:** Smooth exponential wheel zoom and trackpad pinch zoom anchored at the mouse pointer.
+- **GPU-accelerated PDF theming (WGSL shader):** Zero-cost instant theme switching (`light`, `dark`, `oled`, `sepia`, `gruvbox_dark`, `solarized_dark`, or custom `[themes.<name>]` in `config.toml`) without re-rendering pages.
+- **Text search & highlights:** `Ctrl+F` or `/` to search across the entire document with case-sensitivity toggle and match highlights (`Enter`/`n`/`F3` next, `Shift+Enter`/`Shift+N`/`Shift+F3` prev).
+- **TOC / Bookmarks sidebar:** Press `Tab` (or click `TOC`) to browse the PDF outline and jump to sections.
+- **Configurable mouse & keyboard controls:** Remap pan button, wheel / Ctrl+wheel / Shift+wheel actions, double-click action, and all shortcuts in `config.toml`.
 - **Drag-and-drop** PDF opening + native file picker.
 
 ## Setup

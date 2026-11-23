@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod pdf;
+mod shader;
 mod theme;
 
 use std::path::PathBuf;
