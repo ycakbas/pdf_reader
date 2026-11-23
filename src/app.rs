@@ -232,6 +232,11 @@ pub struct PdfReaderApp {
     goto_focus_requested: bool,
     goto_input: String,
     thumb_cache: HashMap<usize, egui::TextureHandle>,
+    last_thumb_synced_page: Option<usize>,
+
+    // Scrollbar drag state (survives pointer leaving window)
+    dragging_v_scrollbar: bool,
+    dragging_h_scrollbar: bool,
 
     // Settings popup state
     settings_open: bool,
@@ -250,6 +255,7 @@ pub struct PdfReaderApp {
     // Interaction state (links & text selection)
     links_cache: HashMap<usize, Vec<PageLink>>,
     drag_mode: DragMode,
+    drag_button: Option<egui::PointerButton>,
     selection: Option<TextSelection>,
 
     cache: PageCache,
@@ -306,6 +312,9 @@ impl PdfReaderApp {
             goto_focus_requested: false,
             goto_input: String::new(),
             thumb_cache: HashMap::new(),
+            last_thumb_synced_page: None,
+            dragging_v_scrollbar: false,
+            dragging_h_scrollbar: false,
             settings_open: false,
             settings_tab: SettingsTab::Mouse,
             settings_status: None,
@@ -318,6 +327,7 @@ impl PdfReaderApp {
             search_active_idx: 0,
             links_cache: HashMap::new(),
             drag_mode: DragMode::None,
+            drag_button: None,
             selection: None,
             cache: PageCache::new(),
         };
@@ -346,11 +356,13 @@ impl PdfReaderApp {
                 self.doc = Some(doc);
                 self.cache.clear(self.wgpu_state.as_ref());
                 self.thumb_cache.clear();
+                self.last_thumb_synced_page = None;
                 self.links_cache.clear();
                 self.nav_back_stack.clear();
                 self.nav_forward_stack.clear();
                 self.selection = None;
                 self.drag_mode = DragMode::None;
+                self.drag_button = None;
                 self.search_matches.clear();
                 self.search_last_executed.clear();
                 self.search_active_idx = 0;
@@ -624,6 +636,7 @@ impl PdfReaderApp {
                 self.show_thumbnails = !self.show_thumbnails;
                 if self.show_thumbnails {
                     self.show_toc = false;
+                    self.last_thumb_synced_page = None;
                 }
             }
             Action::ToggleContinuous => {
@@ -787,6 +800,7 @@ impl PdfReaderApp {
                 self.show_thumbnails = !self.show_thumbnails;
                 if self.show_thumbnails {
                     self.show_toc = false;
+                    self.last_thumb_synced_page = None;
                 }
             }
 
@@ -1230,10 +1244,20 @@ impl PdfReaderApp {
         let mut rendered_this_frame = 0_usize;
         let ctx = ui.ctx().clone();
 
-        egui::ScrollArea::vertical()
+        let mut scroll_area = egui::ScrollArea::vertical()
             .id_salt("thumb_scroll")
-            .auto_shrink([false, false])
-            .show_rows(ui, row_h, count, |ui, row_range| {
+            .auto_shrink([false, false]);
+
+        // Auto-scroll thumbnail sidebar to keep the highlighted page visible whenever current_page changes
+        if self.last_thumb_synced_page != Some(self.current_page) {
+            let avail_h = ui.available_height().max(row_h);
+            let target_y =
+                (self.current_page as f32 * row_h - avail_h * 0.5 + row_h * 0.5).max(0.0);
+            scroll_area = scroll_area.vertical_scroll_offset(target_y);
+            self.last_thumb_synced_page = Some(self.current_page);
+        }
+
+        scroll_area.show_rows(ui, row_h, count, |ui, row_range| {
                 for page_idx in row_range {
                     // Lazily render at most 2 visible thumbnails per frame so opening stays instant
                     if !self.thumb_cache.contains_key(&page_idx) && rendered_this_frame < 2 {
@@ -1331,6 +1355,13 @@ impl PdfReaderApp {
         let pad = 2.0_f32;
         let mut active = false;
 
+        let (primary_down, latest_pos) =
+            ui.ctx().input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+        if !primary_down {
+            self.dragging_v_scrollbar = false;
+            self.dragging_h_scrollbar = false;
+        }
+
         // Vertical scrollbar (right edge)
         if show_v {
             let track_bottom = if show_h {
@@ -1346,7 +1377,11 @@ impl PdfReaderApp {
             if track_rect.height() > 32.0 {
                 let id = ui.make_persistent_id("pdf_v_scrollbar");
                 let resp = ui.interact(track_rect, id, egui::Sense::click_and_drag());
-                let is_hot = resp.hovered() || resp.dragged();
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.dragging_v_scrollbar = true;
+                }
+                let is_dragging = self.dragging_v_scrollbar || resp.dragged();
+                let is_hot = resp.hovered() || is_dragging;
                 if is_hot {
                     active = true;
                 }
@@ -1355,8 +1390,8 @@ impl PdfReaderApp {
                 let thumb_h = (track_rect.height() * visible_frac).max(28.0);
                 let travel = (track_rect.height() - thumb_h).max(1.0);
 
-                if (resp.dragged() || resp.clicked())
-                    && let Some(pos) = resp.interact_pointer_pos()
+                if (is_dragging || resp.clicked())
+                    && let Some(pos) = resp.interact_pointer_pos().or(latest_pos)
                 {
                     let t = ((pos.y - track_rect.min.y - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
                     self.scroll_y = min_y + t * (max_y - min_y);
@@ -1376,7 +1411,7 @@ impl PdfReaderApp {
                 } else {
                     egui::Color32::from_rgba_unmultiplied(20, 20, 24, 55)
                 };
-                let thumb_bg = if resp.dragged() {
+                let thumb_bg = if is_dragging {
                     egui::Color32::from_rgba_unmultiplied(220, 220, 230, 230)
                 } else if resp.hovered() {
                     egui::Color32::from_rgba_unmultiplied(195, 195, 205, 200)
@@ -1388,7 +1423,7 @@ impl PdfReaderApp {
                 painter.rect_filled(thumb_rect, 4.0, thumb_bg);
 
                 // Floating page indicator badge while dragging the vertical scrollbar
-                if resp.dragged() {
+                if is_dragging {
                     let badge_text = format!("Page {} / {}", self.current_page + 1, self.page_count());
                     let badge_pos = egui::pos2(track_rect.min.x - 10.0, thumb_rect.center().y);
                     let galley = painter.layout_no_wrap(
@@ -1426,7 +1461,11 @@ impl PdfReaderApp {
             if track_rect.width() > 32.0 {
                 let id = ui.make_persistent_id("pdf_h_scrollbar");
                 let resp = ui.interact(track_rect, id, egui::Sense::click_and_drag());
-                let is_hot = resp.hovered() || resp.dragged();
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    self.dragging_h_scrollbar = true;
+                }
+                let is_dragging = self.dragging_h_scrollbar || resp.dragged();
+                let is_hot = resp.hovered() || is_dragging;
                 if is_hot {
                     active = true;
                 }
@@ -1436,8 +1475,8 @@ impl PdfReaderApp {
                 let travel = (track_rect.width() - thumb_w).max(1.0);
 
                 // Note: positive scroll_x shifts page right (revealing left side), so map t=0 -> +max_x, t=1 -> -max_x
-                if (resp.dragged() || resp.clicked())
-                    && let Some(pos) = resp.interact_pointer_pos()
+                if (is_dragging || resp.clicked())
+                    && let Some(pos) = resp.interact_pointer_pos().or(latest_pos)
                 {
                     let t = ((pos.x - track_rect.min.x - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
                     self.scroll_x = max_x - t * (2.0 * max_x);
@@ -1457,7 +1496,7 @@ impl PdfReaderApp {
                 } else {
                     egui::Color32::from_rgba_unmultiplied(20, 20, 24, 55)
                 };
-                let thumb_bg = if resp.dragged() {
+                let thumb_bg = if is_dragging {
                     egui::Color32::from_rgba_unmultiplied(220, 220, 230, 230)
                 } else if resp.hovered() {
                     egui::Color32::from_rgba_unmultiplied(195, 195, 205, 200)
@@ -1673,10 +1712,14 @@ impl PdfReaderApp {
         }
         self.clamp_scroll(rect.size());
 
-        // Check if pointer is currently over a scrollbar zone so canvas clicks/drags don't steal it
+        // Check if pointer is currently over/dragging a scrollbar so canvas clicks/drags don't steal it
         let hover_pos = ui.ctx().input(|i| i.pointer.hover_pos());
-        let on_scrollbar = self.config.show_scrollbars
-            && hover_pos.is_some_and(|p| p.x >= rect.max.x - 16.0 || p.y >= rect.max.y - 16.0);
+        let latest_pos = ui.ctx().input(|i| i.pointer.latest_pos());
+        let on_scrollbar = self.dragging_v_scrollbar
+            || self.dragging_h_scrollbar
+            || (self.config.show_scrollbars
+                && hover_pos
+                    .is_some_and(|p| p.x >= rect.max.x - 16.0 || p.y >= rect.max.y - 16.0));
 
         let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
@@ -1749,30 +1792,33 @@ impl PdfReaderApp {
         // Drag start: dispatch based on configured per-button DragAction (Space + Left always pans)
         let space_held = ui.ctx().input(|i| i.key_down(egui::Key::Space));
         if response.drag_started() && !on_scrollbar {
-            let drag_action = if response.drag_started_by(egui::PointerButton::Primary) {
-                if space_held {
+            let (started_btn, drag_action) = if response.drag_started_by(egui::PointerButton::Primary)
+            {
+                let act = if space_held {
                     DragAction::Pan
                 } else {
                     self.config.mouse.left_drag
-                }
+                };
+                (Some(egui::PointerButton::Primary), act)
             } else if response.drag_started_by(egui::PointerButton::Middle) {
-                self.config.mouse.middle_drag
+                (Some(egui::PointerButton::Middle), self.config.mouse.middle_drag)
             } else if response.drag_started_by(egui::PointerButton::Secondary) {
-                self.config.mouse.right_drag
+                (Some(egui::PointerButton::Secondary), self.config.mouse.right_drag)
             } else {
-                DragAction::None
+                (None, DragAction::None)
             };
 
             match drag_action {
                 DragAction::Pan => {
                     self.drag_mode = DragMode::Pan;
+                    self.drag_button = started_btn;
                 }
                 DragAction::SelectText => {
                     // Use press origin if available so selection starts right where the user pressed
                     let press_pos = ui
                         .ctx()
                         .input(|i| i.pointer.press_origin())
-                        .or(hover_pos);
+                        .or(latest_pos);
                     let start_pt = press_pos.and_then(|pos| {
                         visible_pages.iter().find_map(|&(page_idx, page_rect)| {
                             if page_rect.contains(pos) {
@@ -1801,36 +1847,46 @@ impl PdfReaderApp {
                             text,
                         });
                         self.drag_mode = DragMode::SelectText;
+                        self.drag_button = started_btn;
                     } else {
                         self.selection = None;
                         self.drag_mode = DragMode::None;
+                        self.drag_button = None;
                     }
                 }
                 DragAction::None => {
                     self.drag_mode = DragMode::None;
+                    self.drag_button = None;
                 }
             }
         }
 
-        if response.drag_stopped() {
+        // End drag only when the initiating mouse button is actually released
+        // (keeps drag alive even if the cursor leaves the window!)
+        if let Some(btn) = self.drag_button
+            && !ui.ctx().input(|i| i.pointer.button_down(btn))
+        {
             self.drag_mode = DragMode::None;
+            self.drag_button = None;
         }
 
-        // Active drag update
+        // Active drag update (uses pointer.delta() / latest_pos() so outside-window movement keeps working)
         match self.drag_mode {
             DragMode::Pan => {
-                let delta = response.drag_delta();
-                self.scroll_x += delta.x;
-                if self.continuous_scroll {
-                    self.scroll_y -= delta.y;
-                } else {
-                    self.scroll_y += delta.y;
+                let delta = ui.ctx().input(|i| i.pointer.delta());
+                if delta != egui::Vec2::ZERO {
+                    self.scroll_x += delta.x;
+                    if self.continuous_scroll {
+                        self.scroll_y -= delta.y;
+                    } else {
+                        self.scroll_y += delta.y;
+                    }
+                    self.clamp_scroll(rect.size());
                 }
-                self.clamp_scroll(rect.size());
             }
             DragMode::SelectText => {
                 if let (Some(sel), Some(pos), Some(doc)) =
-                    (&mut self.selection, hover_pos, &self.doc)
+                    (&mut self.selection, latest_pos, &self.doc)
                     && let Some(&(_, page_rect)) =
                         visible_pages.iter().find(|&&(idx, _)| idx == sel.page_index)
                 {
