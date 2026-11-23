@@ -42,6 +42,12 @@ pub struct Config {
     pub page_gap: f32,
     /// Initial zoom fit mode when opening the viewer.
     pub default_fit_mode: DefaultFitMode,
+    /// Supersampling multiplier applied on top of display DPI (`1.0` = native, `1.5–2.0` = sharper).
+    pub render_scale: f32,
+    /// Maximum rasterized page width in pixels (higher = sharper at high zoom, uses more VRAM/CPU).
+    pub max_render_width: i32,
+    /// Enable PDFium LCD subpixel text rendering for crisper text.
+    pub lcd_text_rendering: bool,
     /// Mouse behavior settings.
     pub mouse: MouseConfig,
     /// Keyboard shortcut bindings.
@@ -59,6 +65,9 @@ impl Default for Config {
             continuous_scroll: true,
             page_gap: 12.0,
             default_fit_mode: DefaultFitMode::FitWidth,
+            render_scale: 1.5,
+            max_render_width: 4096,
+            lcd_text_rendering: true,
             mouse: MouseConfig::default(),
             shortcuts: ShortcutConfig::default(),
             themes: BTreeMap::new(),

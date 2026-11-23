@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use pdfium_render::prelude::*;
 
-pub const MAX_RENDER_WIDTH_PX: i32 = 3072;
+pub const MIN_RENDER_WIDTH_PX: i32 = 64;
+pub const HARD_MAX_RENDER_WIDTH_PX: i32 = 8192;
 
 static PDFIUM: OnceLock<Pdfium> = OnceLock::new();
 
@@ -147,17 +148,29 @@ impl OpenDocument {
     }
 
     /// Render a single page to RGBA8 at the requested target pixel width.
-    pub fn render_page(&self, page_index: usize, target_width_px: i32) -> Result<RenderedPage> {
+    pub fn render_page(
+        &self,
+        page_index: usize,
+        target_width_px: i32,
+        max_width_px: i32,
+        lcd_text: bool,
+    ) -> Result<RenderedPage> {
         let page = self
             .doc
             .pages()
             .get(page_index as i32)
             .with_context(|| format!("Invalid page index {page_index}"))?;
 
-        let clamped_width = target_width_px.clamp(64, MAX_RENDER_WIDTH_PX);
+        let max_w = max_width_px.clamp(512, HARD_MAX_RENDER_WIDTH_PX);
+        let max_h = ((max_w as f32) * 1.6) as i32;
+        let clamped_width = target_width_px.clamp(MIN_RENDER_WIDTH_PX, max_w);
         let render_config = PdfRenderConfig::new()
             .set_target_width(clamped_width)
-            .set_maximum_height(4096);
+            .set_maximum_height(max_h)
+            .use_lcd_text_rendering(lcd_text)
+            .set_text_smoothing(true)
+            .set_image_smoothing(true)
+            .set_path_smoothing(true);
 
         let bitmap = page
             .render_with_config(&render_config)

@@ -10,8 +10,8 @@ use crate::config::{
     WheelAction,
 };
 use crate::pdf::{
-    BookmarkNode, LinkTarget, MAX_RENDER_WIDTH_PX, MatchRectPt, OpenDocument, PageLink,
-    SearchMatch, init_pdfium,
+    BookmarkNode, HARD_MAX_RENDER_WIDTH_PX, LinkTarget, MIN_RENDER_WIDTH_PX, MatchRectPt,
+    OpenDocument, PageLink, SearchMatch, init_pdfium,
 };
 use crate::shader::{PdfShaderResources, paint_page_callback};
 use crate::theme::{ResolvedTheme, all_themes};
@@ -129,11 +129,14 @@ impl PageCache {
         doc: &OpenDocument,
         page_index: usize,
         clamped_target_width_px: i32,
+        max_width_px: i32,
+        lcd_text: bool,
         theme: &ResolvedTheme,
         ctx: &egui::Context,
         wgpu_state: Option<&egui_wgpu::RenderState>,
     ) -> anyhow::Result<()> {
-        let mut rendered = doc.render_page(page_index, clamped_target_width_px)?;
+        let mut rendered =
+            doc.render_page(page_index, clamped_target_width_px, max_width_px, lcd_text)?;
 
         if let Some(old) = self.entries.remove(&page_index)
             && let (Some(rs), Some(old_key)) = (wgpu_state, old.gpu_key)
@@ -1027,6 +1030,48 @@ impl PdfReaderApp {
                                 ui.label("Show Scrollbars:");
                                 ui.checkbox(&mut self.config.show_scrollbars, "");
                                 ui.end_row();
+
+                                ui.label("Render Scale (Sharpness):");
+                                let prev_scale = self.config.render_scale;
+                                ui.add(
+                                    egui::Slider::new(&mut self.config.render_scale, 1.0..=3.0)
+                                        .step_by(0.1)
+                                        .fixed_decimals(1)
+                                        .suffix("x"),
+                                )
+                                .on_hover_text(
+                                    "Supersampling multiplier on top of display DPI (1.5x–2.0x for crisp text)",
+                                );
+                                if (self.config.render_scale - prev_scale).abs() > 1e-4 {
+                                    self.cache.clear(self.wgpu_state.as_ref());
+                                }
+                                ui.end_row();
+
+                                ui.label("Max Resolution (px):");
+                                let prev_max_w = self.config.max_render_width;
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.config.max_render_width,
+                                        1536..=6144,
+                                    )
+                                    .step_by(256.0)
+                                    .suffix(" px"),
+                                )
+                                .on_hover_text(
+                                    "Maximum rasterized page width (higher = sharper when zoomed in, more VRAM)",
+                                );
+                                if self.config.max_render_width != prev_max_w {
+                                    self.cache.clear(self.wgpu_state.as_ref());
+                                }
+                                ui.end_row();
+
+                                ui.label("LCD Subpixel Text:");
+                                let prev_lcd = self.config.lcd_text_rendering;
+                                ui.checkbox(&mut self.config.lcd_text_rendering, "");
+                                if self.config.lcd_text_rendering != prev_lcd {
+                                    self.cache.clear(self.wgpu_state.as_ref());
+                                }
+                                ui.end_row();
                             });
                     }
                     SettingsTab::Mouse => {
@@ -1180,6 +1225,10 @@ impl PdfReaderApp {
                         self.config.show_toolbar = defaults.show_toolbar;
                         self.config.show_scrollbars = defaults.show_scrollbars;
                         self.config.default_fit_mode = defaults.default_fit_mode;
+                        self.config.render_scale = defaults.render_scale;
+                        self.config.max_render_width = defaults.max_render_width;
+                        self.config.lcd_text_rendering = defaults.lcd_text_rendering;
+                        self.cache.clear(self.wgpu_state.as_ref());
                         self.continuous_scroll = self.config.continuous_scroll;
                         self.fit_mode = FitMode::from(self.config.default_fit_mode);
                         self.settings_status = Some("Reset to defaults (click Save to persist)".into());
@@ -1308,7 +1357,7 @@ impl PdfReaderApp {
                     // Lazily render at most 2 visible thumbnails per frame so opening stays instant
                     if !self.thumb_cache.contains_key(&page_idx) && rendered_this_frame < 2 {
                         if let Some(doc) = &self.doc
-                            && let Ok(rendered) = doc.render_page(page_idx, 160)
+                            && let Ok(rendered) = doc.render_page(page_idx, 160, 512, false)
                         {
                             let color_img = egui::ColorImage::from_rgba_unmultiplied(
                                 [rendered.width, rendered.height],
@@ -2129,12 +2178,18 @@ impl PdfReaderApp {
 
         // Render visible pages into LRU cache
         let ppp = ui.ctx().pixels_per_point();
+        let render_scale = self.config.render_scale.clamp(0.5, 4.0);
+        let max_render_w = self
+            .config
+            .max_render_width
+            .clamp(512, HARD_MAX_RENDER_WIDTH_PX);
+        let lcd_text = self.config.lcd_text_rendering;
         let use_gpu = self.wgpu_state.is_some();
         let theme = self.active_theme().clone();
 
         for &(page_idx, page_rect) in &visible_pages {
-            let clamped_target_w =
-                ((page_rect.width() * ppp).round() as i32).clamp(64, MAX_RENDER_WIDTH_PX);
+            let clamped_target_w = ((page_rect.width() * ppp * render_scale).round() as i32)
+                .clamp(MIN_RENDER_WIDTH_PX, max_render_w);
 
             let should_render = if is_zooming && self.cache.has_page(page_idx) {
                 false
@@ -2149,6 +2204,8 @@ impl PdfReaderApp {
                         doc,
                         page_idx,
                         clamped_target_w,
+                        max_render_w,
+                        lcd_text,
                         &theme,
                         ui.ctx(),
                         self.wgpu_state.as_ref(),
@@ -2262,8 +2319,9 @@ impl PdfReaderApp {
                 first_vis.checked_sub(1),
             ];
             for adj in candidates.into_iter().flatten() {
-                let adj_w = ((doc.page_size_pt(adj).0 * self.zoom * ppp).round() as i32)
-                    .clamp(64, MAX_RENDER_WIDTH_PX);
+                let adj_w = ((doc.page_size_pt(adj).0 * self.zoom * ppp * render_scale).round()
+                    as i32)
+                    .clamp(MIN_RENDER_WIDTH_PX, max_render_w);
                 if self
                     .cache
                     .needs_render(adj, adj_w, &theme.name, use_gpu)
@@ -2272,6 +2330,8 @@ impl PdfReaderApp {
                         doc,
                         adj,
                         adj_w,
+                        max_render_w,
+                        lcd_text,
                         &theme,
                         ui.ctx(),
                         self.wgpu_state.as_ref(),
