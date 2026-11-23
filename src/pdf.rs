@@ -470,6 +470,40 @@ impl OpenDocument {
         out
     }
 
+    /// Decode a specific image object from a page into RGBA8 pixels (for clipboard copy, etc.).
+    pub fn extract_page_image_rgba(
+        &self,
+        page_index: usize,
+        object_index: usize,
+    ) -> Result<RenderedPage> {
+        let page = self
+            .doc
+            .pages()
+            .get(page_index as i32)
+            .with_context(|| format!("Invalid page index {page_index}"))?;
+        let obj = page
+            .objects()
+            .get(object_index)
+            .with_context(|| format!("Invalid object index {object_index}"))?;
+        let img_obj = obj
+            .as_image_object()
+            .context("Selected PDF object is not an image")?;
+
+        let dynamic = img_obj
+            .get_processed_image(&self.doc)
+            .or_else(|_| img_obj.get_raw_image())
+            .context("Failed to decode PDF image object")?;
+
+        let rgba_img = dynamic.into_rgba8();
+        let width = rgba_img.width() as usize;
+        let height = rgba_img.height() as usize;
+        Ok(RenderedPage {
+            width,
+            height,
+            rgba: rgba_img.into_raw(),
+        })
+    }
+
     /// Export a specific image object from a page to `dest` (format inferred from file extension).
     pub fn export_page_image(
         &self,

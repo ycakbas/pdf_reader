@@ -990,15 +990,24 @@ impl PdfReaderApp {
             self.handle_side_button(self.config.mouse.forward_button);
         }
 
-        // Copy selected text with Ctrl+C / Cmd+C when not typing in an input box
-        if !typing
-            && let Some(tab) = self.current_tab()
-            && let Some(sel) = &tab.selection
-            && !sel.text.is_empty()
-            && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C))
-        {
-            ctx.copy_text(sel.text.clone());
-            return;
+        // Copy selected text or selected image with Ctrl+C / Cmd+C when not typing in an input box
+        if !typing && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::C)) {
+            if let Some(tab) = self.current_tab() {
+                if let Some(sel) = &tab.selection
+                    && !sel.text.is_empty()
+                {
+                    ctx.copy_text(sel.text.clone());
+                    self.toast = Some((
+                        "Copied text".into(),
+                        Instant::now() + Duration::from_secs(2),
+                    ));
+                    return;
+                }
+                if let Some((img_page, img)) = tab.selected_image.clone() {
+                    self.copy_image_to_clipboard(ctx, img_page, &img);
+                    return;
+                }
+            }
         }
 
         // Alt+Left / Alt+Right for link navigation history
@@ -1792,6 +1801,36 @@ impl PdfReaderApp {
         self.goto_open = open && !close_requested;
     }
 
+    fn copy_image_to_clipboard(
+        &mut self,
+        ctx: &egui::Context,
+        page_index: usize,
+        img: &PageImage,
+    ) {
+        let Some(tab) = self.current_tab() else {
+            return;
+        };
+        match tab.doc.extract_page_image_rgba(page_index, img.object_index) {
+            Ok(rendered) => {
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [rendered.width, rendered.height],
+                    &rendered.rgba,
+                );
+                ctx.copy_image(color_img);
+                self.toast = Some((
+                    format!("Copied image ({}x{})", rendered.width, rendered.height),
+                    Instant::now() + Duration::from_secs(2),
+                ));
+            }
+            Err(err) => {
+                self.toast = Some((
+                    format!("Copy failed: {err}"),
+                    Instant::now() + Duration::from_secs(4),
+                ));
+            }
+        }
+    }
+
     fn export_image_dialog(&mut self, page_index: usize, img: &PageImage) {
         let default_name = format!("page_{}_image_{}.png", page_index + 1, img.object_index + 1);
         let Some(dest) = rfd::FileDialog::new()
@@ -1839,6 +1878,7 @@ impl PdfReaderApp {
 
         let mut close_menu = false;
         let mut do_copy_text = false;
+        let mut do_copy_image: Option<(usize, PageImage)> = None;
         let mut do_export_image: Option<(usize, PageImage)> = None;
         let mut do_open_link: Option<LinkTarget> = None;
         let mut do_copy_url: Option<String> = None;
@@ -1856,6 +1896,10 @@ impl PdfReaderApp {
                     }
 
                     if let Some((img_page, img)) = image_opt {
+                        if ui.button("Copy Image (Ctrl+C)").clicked() {
+                            do_copy_image = Some((img_page, img.clone()));
+                            close_menu = true;
+                        }
                         let label = if img.pixel_width > 0 && img.pixel_height > 0 {
                             format!("Export Image ({}x{})...", img.pixel_width, img.pixel_height)
                         } else {
@@ -1910,6 +1954,9 @@ impl PdfReaderApp {
                 "Copied text".into(),
                 Instant::now() + Duration::from_secs(2),
             ));
+        }
+        if let Some((p, img)) = do_copy_image {
+            self.copy_image_to_clipboard(ctx, p, &img);
         }
         if let Some((p, img)) = do_export_image {
             self.export_image_dialog(p, &img);
