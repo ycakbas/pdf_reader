@@ -57,6 +57,14 @@ pub struct PageLink {
     pub target: LinkTarget,
 }
 
+#[derive(Debug, Clone)]
+pub struct PageImage {
+    pub object_index: usize,
+    pub rect: MatchRectPt,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
 /// Locate and bind to `libpdfium` once per process using a cross-platform search order:
 /// 1. `PDFIUM_LIB_DIR` environment variable
 /// 2. Directory containing the current executable (and `<exe_dir>/lib`)
@@ -340,6 +348,167 @@ impl OpenDocument {
         }
 
         (rects, selected)
+    }
+
+    /// Expand a character index to the surrounding word range `(lo, hi)` (inclusive).
+    pub fn word_range_at(&self, page_index: usize, char_idx: usize) -> Option<(usize, usize)> {
+        let page = self.doc.pages().get(page_index as i32).ok()?;
+        let text = page.text().ok()?;
+        let chars = text.chars();
+        let len = chars.len();
+        if char_idx >= len {
+            return None;
+        }
+
+        let target_class = char_word_class(chars.get(char_idx).ok()?.unicode_char()?);
+        let mut lo = char_idx;
+        while lo > 0 {
+            let Ok(ch) = chars.get(lo - 1) else {
+                break;
+            };
+            let Some(c) = ch.unicode_char() else {
+                break;
+            };
+            if char_word_class(c) != target_class {
+                break;
+            }
+            lo -= 1;
+        }
+
+        let mut hi = char_idx;
+        while hi + 1 < len {
+            let Ok(ch) = chars.get(hi + 1) else {
+                break;
+            };
+            let Some(c) = ch.unicode_char() else {
+                break;
+            };
+            if char_word_class(c) != target_class {
+                break;
+            }
+            hi += 1;
+        }
+
+        Some((lo, hi))
+    }
+
+    /// Expand a character index to the surrounding visual line range `(lo, hi)` (inclusive).
+    pub fn line_range_at(&self, page_index: usize, char_idx: usize) -> Option<(usize, usize)> {
+        let page = self.doc.pages().get(page_index as i32).ok()?;
+        let text = page.text().ok()?;
+        let chars = text.chars();
+        let len = chars.len();
+        if char_idx >= len {
+            return None;
+        }
+
+        let anchor = chars.get(char_idx).ok()?;
+        let anchor_y = anchor.origin_y().ok()?.value;
+        let line_tol = (anchor.scaled_font_size().value * 0.65).max(5.0);
+
+        let same_line = |idx: usize| -> bool {
+            let Ok(ch) = chars.get(idx) else {
+                return false;
+            };
+            if let Some(c) = ch.unicode_char()
+                && (c == '\n' || c == '\r')
+            {
+                return false;
+            }
+            if let Ok(y) = ch.origin_y() {
+                (y.value - anchor_y).abs() <= line_tol
+            } else {
+                false
+            }
+        };
+
+        let mut lo = char_idx;
+        while lo > 0 && same_line(lo - 1) {
+            lo -= 1;
+        }
+
+        let mut hi = char_idx;
+        while hi + 1 < len && same_line(hi + 1) {
+            hi += 1;
+        }
+
+        Some((lo, hi))
+    }
+
+    /// Extract all image objects on a page with their top-left-origin bounding boxes.
+    pub fn page_images(&self, page_index: usize) -> Vec<PageImage> {
+        let Ok(page) = self.doc.pages().get(page_index as i32) else {
+            return Vec::new();
+        };
+        let page_height = self.page_size_pt(page_index).1;
+        let mut out = Vec::new();
+
+        for (object_index, obj) in page.objects().iter().enumerate() {
+            let Some(img) = obj.as_image_object() else {
+                continue;
+            };
+            let Ok(b) = obj.bounds() else {
+                continue;
+            };
+            let rect = MatchRectPt {
+                left: b.left().value,
+                top: (page_height - b.top().value).max(0.0),
+                right: b.right().value,
+                bottom: (page_height - b.bottom().value).max(0.0),
+            };
+            let pixel_width = img.width().map(|p| p.max(0) as u32).unwrap_or(0);
+            let pixel_height = img.height().map(|p| p.max(0) as u32).unwrap_or(0);
+
+            out.push(PageImage {
+                object_index,
+                rect,
+                pixel_width,
+                pixel_height,
+            });
+        }
+
+        out
+    }
+
+    /// Export a specific image object from a page to `dest` (format inferred from file extension).
+    pub fn export_page_image(
+        &self,
+        page_index: usize,
+        object_index: usize,
+        dest: &Path,
+    ) -> Result<()> {
+        let page = self
+            .doc
+            .pages()
+            .get(page_index as i32)
+            .with_context(|| format!("Invalid page index {page_index}"))?;
+        let obj = page
+            .objects()
+            .get(object_index)
+            .with_context(|| format!("Invalid object index {object_index}"))?;
+        let img_obj = obj
+            .as_image_object()
+            .context("Selected PDF object is not an image")?;
+
+        let dynamic = img_obj
+            .get_processed_image(&self.doc)
+            .or_else(|_| img_obj.get_raw_image())
+            .context("Failed to decode PDF image object")?;
+
+        dynamic
+            .save(dest)
+            .with_context(|| format!("Failed to save image to {}", dest.display()))?;
+        Ok(())
+    }
+}
+
+fn char_word_class(c: char) -> u8 {
+    if c.is_alphanumeric() || c == '_' || c == '\'' {
+        0
+    } else if c.is_whitespace() {
+        1
+    } else {
+        2
     }
 }
 

@@ -11,7 +11,7 @@ use crate::config::{
 };
 use crate::pdf::{
     BookmarkNode, HARD_MAX_RENDER_WIDTH_PX, LinkTarget, MIN_RENDER_WIDTH_PX, MatchRectPt,
-    OpenDocument, PageLink, SearchMatch, init_pdfium,
+    OpenDocument, PageImage, PageLink, SearchMatch, init_pdfium,
 };
 use crate::shader::{PdfShaderResources, paint_page_callback};
 use crate::theme::{ResolvedTheme, all_themes};
@@ -57,6 +57,13 @@ struct TextSelection {
     head_char: usize,
     rects: Vec<MatchRectPt>,
     text: String,
+}
+
+struct ContextMenuState {
+    pos: egui::Pos2,
+    image: Option<(usize, PageImage)>,
+    link: Option<LinkTarget>,
+    has_text_selection: bool,
 }
 
 struct CachedPageEntry {
@@ -227,7 +234,9 @@ struct TabState {
 
     // Per-tab caches & selection
     links_cache: HashMap<usize, Vec<PageLink>>,
+    images_cache: HashMap<usize, Vec<PageImage>>,
     selection: Option<TextSelection>,
+    selected_image: Option<(usize, PageImage)>,
     thumb_cache: HashMap<usize, egui::TextureHandle>,
     last_thumb_synced_page: Option<usize>,
     cache: PageCache,
@@ -259,7 +268,9 @@ impl TabState {
             search_matches: Vec::new(),
             search_active_idx: 0,
             links_cache: HashMap::new(),
+            images_cache: HashMap::new(),
             selection: None,
+            selected_image: None,
             thumb_cache: HashMap::new(),
             last_thumb_synced_page: None,
             cache: PageCache::new(),
@@ -370,6 +381,13 @@ impl TabState {
         }
     }
 
+    fn ensure_images_loaded(&mut self, page_index: usize) {
+        if !self.images_cache.contains_key(&page_index) {
+            let images = self.doc.page_images(page_index);
+            self.images_cache.insert(page_index, images);
+        }
+    }
+
     fn compute_visible_pages(
         &mut self,
         rect: egui::Rect,
@@ -473,11 +491,13 @@ pub struct PdfReaderApp {
     search_focus_requested: bool,
     search_match_case: bool,
 
-    // Active drag state (canvas-level)
+    // Active drag & context menu state
     drag_mode: DragMode,
     drag_button: Option<egui::PointerButton>,
     pan_start_pointer: Option<egui::Pos2>,
     pan_start_scroll: egui::Vec2,
+    context_menu: Option<ContextMenuState>,
+    toast: Option<(String, Instant)>,
 }
 
 impl PdfReaderApp {
@@ -539,6 +559,8 @@ impl PdfReaderApp {
             drag_button: None,
             pan_start_pointer: None,
             pan_start_scroll: egui::Vec2::ZERO,
+            context_menu: None,
+            toast: None,
         };
 
         for (i, path) in initial_files.into_iter().enumerate() {
@@ -992,6 +1014,10 @@ impl PdfReaderApp {
         }
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            if self.context_menu.is_some() {
+                self.context_menu = None;
+                return;
+            }
             if self.goto_open {
                 self.goto_open = false;
                 return;
@@ -1005,9 +1031,10 @@ impl PdfReaderApp {
                 return;
             }
             if let Some(tab) = self.current_tab_mut()
-                && tab.selection.is_some()
+                && (tab.selection.is_some() || tab.selected_image.is_some())
             {
                 tab.selection = None;
+                tab.selected_image = None;
                 return;
             }
         }
@@ -1765,6 +1792,171 @@ impl PdfReaderApp {
         self.goto_open = open && !close_requested;
     }
 
+    fn export_image_dialog(&mut self, page_index: usize, img: &PageImage) {
+        let default_name = format!("page_{}_image_{}.png", page_index + 1, img.object_index + 1);
+        let Some(dest) = rfd::FileDialog::new()
+            .set_file_name(&default_name)
+            .add_filter("PNG Image", &["png"])
+            .add_filter("JPEG Image", &["jpg", "jpeg"])
+            .add_filter("WebP Image", &["webp"])
+            .add_filter("BMP Image", &["bmp"])
+            .save_file()
+        else {
+            return;
+        };
+
+        if let Some(tab) = self.current_tab() {
+            match tab.doc.export_page_image(page_index, img.object_index, &dest) {
+                Ok(()) => {
+                    let name = dest
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image");
+                    self.toast = Some((
+                        format!("Exported {name}"),
+                        Instant::now() + Duration::from_secs(3),
+                    ));
+                }
+                Err(err) => {
+                    self.toast = Some((
+                        format!("Export failed: {err}"),
+                        Instant::now() + Duration::from_secs(4),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn draw_context_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return;
+        };
+
+        let pos = menu.pos;
+        let image_opt = menu.image.clone();
+        let link_opt = menu.link.clone();
+        let has_text = menu.has_text_selection;
+
+        let mut close_menu = false;
+        let mut do_copy_text = false;
+        let mut do_export_image: Option<(usize, PageImage)> = None;
+        let mut do_open_link: Option<LinkTarget> = None;
+        let mut do_copy_url: Option<String> = None;
+
+        let area_resp = egui::Area::new(egui::Id::unique("pdf_context_menu"))
+            .fixed_pos(pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(175.0);
+
+                    if has_text && ui.button("Copy Text (Ctrl+C)").clicked() {
+                        do_copy_text = true;
+                        close_menu = true;
+                    }
+
+                    if let Some((img_page, img)) = image_opt {
+                        let label = if img.pixel_width > 0 && img.pixel_height > 0 {
+                            format!("Export Image ({}x{})...", img.pixel_width, img.pixel_height)
+                        } else {
+                            "Export Image...".to_string()
+                        };
+                        if ui.button(label).clicked() {
+                            do_export_image = Some((img_page, img));
+                            close_menu = true;
+                        }
+                    }
+
+                    if let Some(link) = link_opt {
+                        match &link {
+                            LinkTarget::InternalPage(p) => {
+                                if ui.button(format!("Go to Page {}", p + 1)).clicked() {
+                                    do_open_link = Some(link);
+                                    close_menu = true;
+                                }
+                            }
+                            LinkTarget::ExternalUri(uri) => {
+                                if ui.button("Open Link in Browser").clicked() {
+                                    do_open_link = Some(link.clone());
+                                    close_menu = true;
+                                }
+                                if ui.button("Copy Link URL").clicked() {
+                                    do_copy_url = Some(uri.clone());
+                                    close_menu = true;
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+
+        // Close if user clicked anywhere outside the menu
+        if ctx.input(|i| i.pointer.any_pressed())
+            && let Some(ptr) = ctx.input(|i| i.pointer.interact_pos())
+            && !area_resp.response.rect.contains(ptr)
+        {
+            close_menu = true;
+        }
+
+        if close_menu {
+            self.context_menu = None;
+        }
+        if do_copy_text
+            && let Some(tab) = self.current_tab()
+            && let Some(sel) = &tab.selection
+        {
+            ctx.copy_text(sel.text.clone());
+            self.toast = Some((
+                "Copied text".into(),
+                Instant::now() + Duration::from_secs(2),
+            ));
+        }
+        if let Some((p, img)) = do_export_image {
+            self.export_image_dialog(p, &img);
+        }
+        if let Some(link) = do_open_link {
+            match link {
+                LinkTarget::InternalPage(p) => self.jump_via_link(p),
+                LinkTarget::ExternalUri(uri) => {
+                    ctx.open_url(egui::OpenUrl::new_tab(uri));
+                }
+            }
+        }
+        if let Some(uri) = do_copy_url {
+            ctx.copy_text(uri);
+            self.toast = Some((
+                "Copied link URL".into(),
+                Instant::now() + Duration::from_secs(2),
+            ));
+        }
+    }
+
+    fn draw_toast(&mut self, ctx: &egui::Context) {
+        let Some((msg, deadline)) = &self.toast else {
+            return;
+        };
+        let now = Instant::now();
+        if now >= *deadline {
+            self.toast = None;
+            return;
+        }
+        ctx.request_repaint_after(*deadline - now);
+
+        egui::Area::new(egui::Id::unique("pdf_toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -20.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_unmultiplied(24, 24, 30, 230))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 7))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(msg).color(egui::Color32::WHITE));
+                    });
+            });
+    }
+
     fn draw_thumbnails_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Pages");
         ui.separator();
@@ -2238,6 +2430,7 @@ impl PdfReaderApp {
         let visible_pages = self.tabs[self.active_tab].compute_visible_pages(rect, cont, gap);
         for &(page_idx, _) in &visible_pages {
             self.tabs[self.active_tab].ensure_links_loaded(page_idx);
+            self.tabs[self.active_tab].ensure_images_loaded(page_idx);
         }
 
         let zoom_now = self.tabs[self.active_tab].zoom;
@@ -2272,6 +2465,29 @@ impl PdfReaderApp {
                     })
             });
 
+        // Pick the smallest (innermost) image containing the pointer so overlapping background images don't shadow foreground ones
+        let hovered_image: Option<(usize, PageImage, egui::Rect)> =
+            hovered_page_pt.and_then(|(page_idx, x_pt, y_pt, page_rect)| {
+                self.tabs[self.active_tab]
+                    .images_cache
+                    .get(&page_idx)?
+                    .iter()
+                    .filter(|img| img.rect.contains(x_pt, y_pt))
+                    .min_by(|a, b| {
+                        let area_a = (a.rect.right - a.rect.left) * (a.rect.bottom - a.rect.top);
+                        let area_b = (b.rect.right - b.rect.left) * (b.rect.bottom - b.rect.top);
+                        area_a.total_cmp(&area_b)
+                    })
+                    .map(|img| (page_idx, img.clone(), page_rect))
+            });
+
+        let hovered_char: Option<(usize, usize)> = hovered_page_pt.and_then(|(page_idx, x_pt, y_pt, _)| {
+            self.tabs[self.active_tab]
+                .doc
+                .char_index_at(page_idx, x_pt, y_pt, 6.0, 6.0)
+                .map(|c| (page_idx, c))
+        });
+
         // Cursor icon & link tooltip
         if response.hovered() {
             if let Some((_, ref link, _)) = hovered_link {
@@ -2283,18 +2499,97 @@ impl PdfReaderApp {
                 response.clone().on_hover_text(tip);
             } else if self.drag_mode == DragMode::Pan {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-            } else if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt
-                && self.tabs[self.active_tab]
-                    .doc
-                    .char_index_at(page_idx, x_pt, y_pt, 6.0, 6.0)
-                    .is_some()
-            {
+            } else if hovered_char.is_some() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            } else if hovered_image.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
         }
 
-        // Click handling: open link or clear selection
-        if response.clicked() && !on_scrollbar {
+        // Triple-click: select entire visual line of text
+        let mut handled_multiclick = false;
+        if response.triple_clicked() && !on_scrollbar {
+            self.context_menu = None;
+            if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt {
+                let tab = &mut self.tabs[self.active_tab];
+                if let Some(ch) = tab.doc.char_index_at(page_idx, x_pt, y_pt, 12.0, 12.0)
+                    && let Some((lo, hi)) = tab.doc.line_range_at(page_idx, ch)
+                {
+                    let (rects, text) = tab.doc.selection_rects_and_text(page_idx, lo, hi);
+                    tab.selection = Some(TextSelection {
+                        page_index: page_idx,
+                        anchor_char: lo,
+                        head_char: hi,
+                        rects,
+                        text,
+                    });
+                    tab.selected_image = None;
+                    handled_multiclick = true;
+                }
+            }
+        }
+
+        // Double-click: select word if over text, select image if over image, else run double_click_action
+        if response.double_clicked() && !handled_multiclick && !on_scrollbar {
+            self.context_menu = None;
+            let mut selected_something = false;
+
+            if let Some((page_idx, x_pt, y_pt, _)) = hovered_page_pt {
+                let tab = &mut self.tabs[self.active_tab];
+                if let Some(ch) = tab.doc.char_index_at(page_idx, x_pt, y_pt, 10.0, 10.0)
+                    && let Some((lo, hi)) = tab.doc.word_range_at(page_idx, ch)
+                {
+                    let (rects, text) = tab.doc.selection_rects_and_text(page_idx, lo, hi);
+                    tab.selection = Some(TextSelection {
+                        page_index: page_idx,
+                        anchor_char: lo,
+                        head_char: hi,
+                        rects,
+                        text,
+                    });
+                    tab.selected_image = None;
+                    selected_something = true;
+                }
+            }
+
+            if !selected_something
+                && let Some((img_page, ref img, _)) = hovered_image
+            {
+                let tab = &mut self.tabs[self.active_tab];
+                tab.selected_image = Some((img_page, img.clone()));
+                tab.selection = None;
+                selected_something = true;
+            }
+
+            if !selected_something && hovered_link.is_none() {
+                let tab = &mut self.tabs[self.active_tab];
+                match self.config.mouse.double_click_action {
+                    DoubleClickAction::FitWidth => {
+                        tab.fit_mode = FitMode::FitWidth;
+                        tab.scroll_x = 0.0;
+                    }
+                    DoubleClickAction::FitPage => {
+                        tab.fit_mode = FitMode::FitPage;
+                        tab.scroll_x = 0.0;
+                    }
+                    DoubleClickAction::ToggleZoom => {
+                        if tab.fit_mode == FitMode::FitPage {
+                            tab.fit_mode = FitMode::FitWidth;
+                        } else {
+                            tab.fit_mode = FitMode::FitPage;
+                            tab.scroll_x = 0.0;
+                        }
+                    }
+                    DoubleClickAction::None => {}
+                }
+                tab.clamp_scroll(rect.size(), cont, gap);
+            }
+            handled_multiclick = true;
+        }
+
+        // Single-click handling: open link, select image, or clear selection
+        if response.clicked() && !handled_multiclick && !on_scrollbar {
+            self.context_menu = None;
             if let Some((_, link, _)) = &hovered_link {
                 match &link.target {
                     LinkTarget::InternalPage(p) => self.jump_via_link(*p),
@@ -2302,14 +2597,49 @@ impl PdfReaderApp {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(uri.clone()));
                     }
                 }
+            } else if hovered_char.is_none()
+                && let Some((img_page, ref img, _)) = hovered_image
+            {
+                let tab = &mut self.tabs[self.active_tab];
+                tab.selected_image = Some((img_page, img.clone()));
+                tab.selection = None;
             } else {
-                self.tabs[self.active_tab].selection = None;
+                let tab = &mut self.tabs[self.active_tab];
+                tab.selection = None;
+                tab.selected_image = None;
+            }
+        }
+
+        // Right-click (non-drag) context menu for image export, copying text, and links
+        if response.secondary_clicked() && !on_scrollbar {
+            if let Some(pos) = hover_pos.or(latest_pos) {
+                let image_target = hovered_image.as_ref().map(|(p, img, _)| (*p, img.clone()));
+                if let Some((img_page, ref img)) = image_target {
+                    self.tabs[self.active_tab].selected_image = Some((img_page, img.clone()));
+                }
+                let link_target = hovered_link.as_ref().map(|(_, l, _)| l.target.clone());
+                let has_text = self.tabs[self.active_tab]
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| !s.text.is_empty());
+
+                if image_target.is_some() || link_target.is_some() || has_text {
+                    self.context_menu = Some(ContextMenuState {
+                        pos,
+                        image: image_target,
+                        link: link_target,
+                        has_text_selection: has_text,
+                    });
+                } else {
+                    self.context_menu = None;
+                }
             }
         }
 
         // Drag start
         let space_held = ui.ctx().input(|i| i.key_down(egui::Key::Space));
         if response.drag_started() && !on_scrollbar {
+            self.context_menu = None;
             let (started_btn, drag_action) =
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     let act = if space_held {
@@ -2371,6 +2701,7 @@ impl PdfReaderApp {
                             rects,
                             text,
                         });
+                        tab.selected_image = None;
                         self.drag_mode = DragMode::SelectText;
                         self.drag_button = started_btn;
                     } else {
@@ -2451,31 +2782,6 @@ impl PdfReaderApp {
                 }
             }
             DragMode::None => {}
-        }
-
-        // Double-click action
-        if response.double_clicked() && hovered_link.is_none() {
-            let tab = &mut self.tabs[self.active_tab];
-            match self.config.mouse.double_click_action {
-                DoubleClickAction::FitWidth => {
-                    tab.fit_mode = FitMode::FitWidth;
-                    tab.scroll_x = 0.0;
-                }
-                DoubleClickAction::FitPage => {
-                    tab.fit_mode = FitMode::FitPage;
-                    tab.scroll_x = 0.0;
-                }
-                DoubleClickAction::ToggleZoom => {
-                    if tab.fit_mode == FitMode::FitPage {
-                        tab.fit_mode = FitMode::FitWidth;
-                    } else {
-                        tab.fit_mode = FitMode::FitPage;
-                        tab.scroll_x = 0.0;
-                    }
-                }
-                DoubleClickAction::None => {}
-            }
-            tab.clamp_scroll(rect.size(), cont, gap);
         }
 
         // Mouse wheel + trackpad pinch zoom
@@ -2689,6 +2995,32 @@ impl PdfReaderApp {
                     lr,
                     2.0,
                     egui::Color32::from_rgba_unmultiplied(80, 160, 255, 45),
+                );
+            }
+
+            if let Some((img_page, ref img)) = tab.selected_image
+                && img_page == page_idx
+            {
+                let ir = egui::Rect::from_min_max(
+                    egui::pos2(
+                        page_rect.min.x + img.rect.left * tab.zoom,
+                        page_rect.min.y + img.rect.top * tab.zoom,
+                    ),
+                    egui::pos2(
+                        page_rect.min.x + img.rect.right * tab.zoom,
+                        page_rect.min.y + img.rect.bottom * tab.zoom,
+                    ),
+                );
+                painter.rect_filled(
+                    ir,
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(70, 140, 255, 45),
+                );
+                painter.rect_stroke(
+                    ir,
+                    2.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(70, 140, 255)),
+                    egui::StrokeKind::Outside,
                 );
             }
 
@@ -2926,5 +3258,7 @@ impl eframe::App for PdfReaderApp {
 
         self.draw_goto_window(&ctx);
         self.draw_settings_window(&ctx);
+        self.draw_context_menu(&ctx);
+        self.draw_toast(&ctx);
     }
 }
