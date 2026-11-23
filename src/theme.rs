@@ -83,9 +83,9 @@ impl ResolvedTheme {
             let out_g = (fg[1] + luma * (bg[1] - fg[1]) + dg * 0.85).clamp(0.0, 1.0);
             let out_b = (fg[2] + luma * (bg[2] - fg[2]) + db * 0.85).clamp(0.0, 1.0);
 
-            px[0] = (out_r * 255.0) as u8;
-            px[1] = (out_g * 255.0) as u8;
-            px[2] = (out_b * 255.0) as u8;
+            px[0] = (out_r * 255.0).round() as u8;
+            px[1] = (out_g * 255.0).round() as u8;
+            px[2] = (out_b * 255.0).round() as u8;
         }
     }
 }
@@ -169,4 +169,24 @@ fn parse_hex_rgb(hex: &str) -> Option<[u8; 3]> {
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some([r, g, b])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dark_theme_remaps_white_and_black() {
+        let themes = builtin_themes();
+        let dark = ResolvedTheme::from_spec("dark", &themes["dark"]);
+
+        // White pixel (paper) -> theme background; Black pixel (ink) -> theme foreground
+        let mut pixels = vec![255, 255, 255, 255, 0, 0, 0, 255];
+        dark.apply_to_rgba(&mut pixels);
+
+        assert_eq!(&pixels[0..3], &dark.background);
+        assert_eq!(&pixels[4..7], &dark.foreground);
+        assert_eq!(pixels[3], 255);
+        assert_eq!(pixels[7], 255);
+    }
 }

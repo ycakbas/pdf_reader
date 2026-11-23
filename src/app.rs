@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eframe::egui;
 
 use crate::config::{Action, Config, DoubleClickAction, KeyBinding, WheelAction};
-use crate::pdf::PdfEngine;
+use crate::pdf::{OpenDocument, init_pdfium};
 use crate::theme::{ResolvedTheme, all_themes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +26,9 @@ pub struct PdfReaderApp {
     themes: Vec<ResolvedTheme>,
     active_theme_idx: usize,
 
-    engine: Option<PdfEngine>,
+    doc: Option<OpenDocument>,
     status_error: Option<String>,
 
-    file_path: Option<PathBuf>,
-    page_count: usize,
     current_page: usize,
     page_size_pt: (f32, f32),
 
@@ -57,20 +55,15 @@ impl PdfReaderApp {
             .unwrap_or(0);
         let show_toolbar = config.show_toolbar;
 
-        let (engine, status_error) = match PdfEngine::init() {
-            Ok(e) => (Some(e), None),
-            Err(err) => (None, Some(err.to_string())),
-        };
+        let status_error = init_pdfium().err().map(|e| e.to_string());
 
         let mut app = Self {
             config,
             bindings,
             themes,
             active_theme_idx,
-            engine,
+            doc: None,
             status_error,
-            file_path: None,
-            page_count: 0,
             current_page: 0,
             page_size_pt: (612.0, 792.0),
             zoom: 1.0,
@@ -91,20 +84,19 @@ impl PdfReaderApp {
         &self.themes[self.active_theme_idx]
     }
 
-    fn open_file(&mut self, path: PathBuf, initial_page: Option<usize>) {
-        let Some(engine) = &self.engine else {
-            return;
-        };
+    fn page_count(&self) -> usize {
+        self.doc.as_ref().map_or(0, |d| d.page_count)
+    }
 
-        match engine.open(&path) {
+    fn open_file(&mut self, path: PathBuf, initial_page: Option<usize>) {
+        match OpenDocument::open(&path) {
             Ok(doc) => {
-                self.page_count = doc.page_count;
                 let target_page = initial_page
                     .unwrap_or(0)
                     .min(doc.page_count.saturating_sub(1));
                 self.current_page = target_page;
                 self.page_size_pt = doc.page_size_pt(target_page).unwrap_or((612.0, 792.0));
-                self.file_path = Some(path);
+                self.doc = Some(doc);
                 self.pan = egui::Vec2::ZERO;
                 self.cached_page = None;
                 self.status_error = None;
@@ -125,16 +117,16 @@ impl PdfReaderApp {
     }
 
     fn goto_page(&mut self, index: usize) {
-        if self.page_count == 0 {
+        let count = self.page_count();
+        if count == 0 {
             return;
         }
-        let clamped = index.min(self.page_count - 1);
+        let clamped = index.min(count - 1);
         if clamped != self.current_page {
             self.current_page = clamped;
             self.pan = egui::Vec2::ZERO;
             self.cached_page = None;
-            if let (Some(engine), Some(path)) = (&self.engine, &self.file_path)
-                && let Ok(doc) = engine.open(path)
+            if let Some(doc) = &self.doc
                 && let Ok(sz) = doc.page_size_pt(clamped)
             {
                 self.page_size_pt = sz;
@@ -147,7 +139,7 @@ impl PdfReaderApp {
             Action::NextPage => self.goto_page(self.current_page.saturating_add(1)),
             Action::PrevPage => self.goto_page(self.current_page.saturating_sub(1)),
             Action::FirstPage => self.goto_page(0),
-            Action::LastPage => self.goto_page(self.page_count.saturating_sub(1)),
+            Action::LastPage => self.goto_page(self.page_count().saturating_sub(1)),
             Action::ZoomIn => {
                 self.fit_mode = FitMode::Manual;
                 self.zoom = (self.zoom * self.config.mouse.zoom_step).clamp(0.1, 10.0);
@@ -206,8 +198,8 @@ impl PdfReaderApp {
         let dropped: Option<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
-                .iter()
-                .find_map(|f| f.path.clone())
+                .first()
+                .map(|f| f.path().to_path_buf())
         });
         if let Some(path) = dropped {
             self.open_file(path, None);
@@ -229,14 +221,11 @@ impl PdfReaderApp {
             return;
         }
 
-        let (Some(engine), Some(path)) = (&self.engine, &self.file_path) else {
+        let Some(doc) = &self.doc else {
             return;
         };
 
-        match engine
-            .open(path)
-            .and_then(|doc| doc.render_page(self.current_page, target_width_px))
-        {
+        match doc.render_page(self.current_page, target_width_px) {
             Ok(mut rendered) => {
                 self.active_theme().apply_to_rgba(&mut rendered.rgba);
                 let color_image = egui::ColorImage::from_rgba_unmultiplied(
@@ -273,8 +262,9 @@ impl PdfReaderApp {
             if ui.button("<").clicked() {
                 self.goto_page(self.current_page.saturating_sub(1));
             }
-            if self.page_count > 0 {
-                ui.label(format!("{} / {}", self.current_page + 1, self.page_count));
+            let count = self.page_count();
+            if count > 0 {
+                ui.label(format!("{} / {count}", self.current_page + 1));
             } else {
                 ui.label("No document");
             }
@@ -319,8 +309,8 @@ impl PdfReaderApp {
                     }
                 });
 
-            if let Some(path) = &self.file_path
-                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            if let Some(doc) = &self.doc
+                && let Some(name) = doc.path.file_name().and_then(|n| n.to_str())
             {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.weak(name);
@@ -347,7 +337,7 @@ impl PdfReaderApp {
             return;
         }
 
-        if self.file_path.is_none() {
+        if self.doc.is_none() {
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -469,14 +459,14 @@ impl eframe::App for PdfReaderApp {
         self.process_shortcuts(&ctx);
 
         if self.show_toolbar {
-            egui::TopBottomPanel::top("toolbar").show_inside(ui, |ui| {
+            egui::Panel::top("toolbar").show(ui, |ui| {
                 self.draw_toolbar(ui);
             });
         }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| {
+            .show(ui, |ui| {
                 self.draw_canvas(ui);
             });
     }

@@ -316,3 +316,27 @@ fn parse_key(name: &str) -> Option<egui::Key> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_roundtrips_toml() {
+        let cfg = Config::default();
+        let serialized = toml::to_string_pretty(&cfg).expect("serialize default config");
+        let parsed: Config = toml::from_str(&serialized).expect("deserialize default config");
+        assert_eq!(parsed.theme, "light");
+        assert_eq!(parsed.mouse.pan_button, MouseButtonSpec::Left);
+        assert!(!parsed.shortcuts.compile().is_empty());
+    }
+
+    #[test]
+    fn shortcut_parser_handles_modifiers_and_keys() {
+        let (mods, key) = parse_shortcut("Ctrl+Shift+G").expect("parse Ctrl+Shift+G");
+        assert!(mods.command);
+        assert!(mods.shift);
+        assert!(!mods.alt);
+        assert_eq!(key, egui::Key::G);
+    }
+}
